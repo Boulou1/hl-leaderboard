@@ -454,7 +454,10 @@ function boardRow(t, index) {
     if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); }
   });
 
-  const venueTags = dedupe(t.venues.map((v) => dexLabel(v.dex)));
+  // "Idle" = funded but flat, which reports as no venue on every clearinghouse.
+  const venueTags = t.venues.length
+    ? dedupe(t.venues.map((v) => dexLabel(v.dex)))
+    : t.equity > 0 ? ["Idle"] : [];
 
   tr.append(
     el("td", { class: "col-rank", text: isEmpty ? "–" : String(index + 1) }),
@@ -580,9 +583,16 @@ function renderTrader() {
   const p = periodOf(t);
   const totalPnl = t.unrealised + t.realised;
 
+  // With no open position the collateral sits free in spot and every perp
+  // clearinghouse reports 0, so "no venue" must not be read as "no money".
+  const equitySub = t.venues.length
+    ? t.venues.map((v) => `${dexLabel(v.dex)} ${usd(v.equity)}`).join(" · ")
+    : t.equity > 0
+      ? "idle collateral — no open position"
+      : "not funded";
+
   $("#t-tiles").replaceChildren(
-    tile("Equity", el("span", { text: usd(t.equity) }),
-      t.venues.length ? t.venues.map((v) => `${dexLabel(v.dex)} ${usd(v.equity)}`).join(" · ") : "not funded"),
+    tile("Equity", el("span", { text: usd(t.equity) }), equitySub),
     tile(`PnL · ${PERIOD_LABEL[state.period]}`, delta(p.pnl), pct(roiOf(t)) + " on starting equity"),
     tile("Unrealised", delta(t.unrealised),
       `${t.positions.length} open position${t.positions.length === 1 ? "" : "s"}`),
