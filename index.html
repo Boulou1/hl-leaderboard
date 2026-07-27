@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow, noarchive">
+<title>HL Leaderboard</title>
+<meta name="description" content="Live Hyperliquid PnL leaderboard.">
+<link rel="preconnect" href="https://api.hyperliquid.xyz">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <div>
+      <h1>HL Leaderboard</h1>
+      <p class="brand-sub">Hyperliquid &middot; live PnL, positions &amp; fills</p>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <div class="status" id="status">
+      <span class="dot" id="status-dot" aria-hidden="true"></span>
+      <span id="status-text">Connecting&hellip;</span>
+    </div>
+    <button type="button" class="btn" id="refresh">Refresh</button>
+  </div>
+</header>
+
+<!-- Filter row: one row, above the content it scopes -->
+<div class="filterbar" role="group" aria-label="Time range">
+  <span class="filter-label">Range</span>
+  <div class="segmented" id="period">
+    <button type="button" data-period="day"     aria-pressed="false">24H</button>
+    <button type="button" data-period="week"    aria-pressed="false">7D</button>
+    <button type="button" data-period="month"   aria-pressed="false">30D</button>
+    <button type="button" data-period="allTime" aria-pressed="true">All</button>
+  </div>
+  <span class="filter-note" id="scope-note">Scopes every figure below</span>
+</div>
+
+<main id="main">
+
+  <!-- ============ LEADERBOARD VIEW ============ -->
+  <section id="view-board" class="view">
+
+    <div class="tiles" id="group-tiles"></div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <h2>Traders</h2>
+        <div class="panel-head-right">
+          <span class="hint">Click a trader for positions &amp; trades</span>
+        </div>
+      </div>
+
+      <div class="table-scroll">
+        <table class="grid" id="board">
+          <caption class="sr-only">Traders ranked by profit and loss over the selected range</caption>
+          <thead>
+            <tr>
+              <th class="col-rank" scope="col">#</th>
+              <th class="col-name" scope="col">Trader</th>
+              <th class="num sortable" scope="col" data-sort="equity">Equity</th>
+              <th class="num sortable" scope="col" data-sort="pnl">PnL <span class="th-sub" id="th-period">All</span></th>
+              <th class="num sortable" scope="col" data-sort="roi">Return</th>
+              <th class="num sortable" scope="col" data-sort="unreal">Unrealised</th>
+              <th class="num sortable" scope="col" data-sort="real">Realised</th>
+              <th class="num sortable" scope="col" data-sort="vol">Volume</th>
+              <th class="num" scope="col">Pos</th>
+              <th class="col-spark" scope="col">Trend</th>
+            </tr>
+          </thead>
+          <tbody id="board-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <p class="footnote">
+      Equity is Hyperliquid&rsquo;s own account value, aggregated across the main
+      order book and all builder-deployed (HIP&#8209;3) perp DEXes. Spot USDC is the same
+      collateral backing those positions, so it is never added on top.
+      PnL is net of deposits and withdrawals.
+    </p>
+  </section>
+
+  <!-- ============ TRADER DETAIL VIEW ============ -->
+  <section id="view-trader" class="view" hidden>
+    <a class="back" href="#/">&larr; All traders</a>
+
+    <div class="trader-head">
+      <div>
+        <h2 id="t-name">&nbsp;</h2>
+        <p class="addr" id="t-addr">&nbsp;</p>
+      </div>
+      <div class="venue-tags" id="t-venues"></div>
+    </div>
+
+    <div class="tiles" id="t-tiles"></div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <h3 id="chart-title">Profit &amp; loss</h3>
+        <div class="segmented small" id="metric">
+          <button type="button" data-metric="pnl"    aria-pressed="true">PnL</button>
+          <button type="button" data-metric="equity" aria-pressed="false">Equity</button>
+        </div>
+      </div>
+      <div class="chart-wrap" id="chart-wrap"></div>
+      <details class="table-view">
+        <summary>Table view</summary>
+        <div class="table-scroll" id="chart-table"></div>
+      </details>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h3>Open positions</h3><span class="hint" id="pos-count"></span></div>
+      <div class="table-scroll" id="positions"></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h3>Trades</h3><span class="hint" id="fill-count"></span></div>
+      <div class="table-scroll" id="fills"></div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="pagefoot">
+  <span>Data: Hyperliquid public API. Read-only, no keys.</span>
+  <span id="updated"></span>
+</footer>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

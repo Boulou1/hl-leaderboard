@@ -1,0 +1,4 @@
+# Keep this page out of search results. The addresses are already public
+# on-chain, but the name -> wallet mapping should not be indexed.
+User-agent: *
+Disallow: /
