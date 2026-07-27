@@ -30,6 +30,14 @@ const TRADERS = [
 Nothing else needs changing. A wallet with no balance and no trades renders as
 "Not funded yet" and starts showing data automatically once it is funded.
 
+## Deploying
+
+Push to `main`; GitHub Pages publishes automatically.
+
+**Bump `?v=N` on both `styles.css` and `app.js` in `index.html` on every deploy.**
+Pages serves assets with `cache-control: max-age=600`, so without it browsers run
+stale code for up to 10 minutes after a push.
+
 ## Data model — three things that are easy to get wrong
 
 These were each verified against the live API, and getting any of them wrong
