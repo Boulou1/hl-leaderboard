@@ -89,7 +89,10 @@ const TRADERS = [
 ];
 
 const PERIOD_LABEL = { day: "24H", week: "7D", month: "30D", allTime: "All" };
-const REFRESH_MS = 60_000;
+// Quiet gap between refreshes, measured from the END of the previous one — a
+// cycle does real on-chain reconstruction and can take a minute, and a timer
+// that fires regardless meant the page was permanently mid-refresh.
+const REFRESH_MS = 120_000;
 const RESCAN_EVERY = 10;   // full multi-dex rescan every Nth refresh
 
 /* ------------------------------------------------------------------ state -- */
@@ -101,6 +104,7 @@ const state = {
   byName: new Map(),    // trader name -> aggregated record
   route: { view: "board", name: null },
   refreshCount: 0,
+  refreshing: false,
   timer: null,
 };
 
@@ -765,9 +769,13 @@ async function loadTrader(trader, knownDexes) {
   };
 }
 
-async function loadAll({ full = false } = {}) {
-  setStatus("loading", "Refreshing…");
-  document.querySelectorAll(".view").forEach((v) => v.classList.add("is-stale"));
+async function loadAll({ full = false, background = false } = {}) {
+  if (state.refreshing) return;   // never let cycles overlap
+  state.refreshing = true;
+  setStatus("loading", background ? "Updating…" : "Refreshing…");
+  // Dimming the page every cycle read as "constantly refreshing" — reserve it
+  // for the initial load and the manual Refresh button.
+  if (!background) document.querySelectorAll(".view").forEach((v) => v.classList.add("is-stale"));
 
   await loadDexes();
   let failures = 0;
@@ -803,18 +811,23 @@ async function loadAll({ full = false } = {}) {
           });
         }
       }
-      render();
+      // Repainting after every trader is welcome on first load (rows appear as
+      // they arrive) but hostile during background refreshes — it yanked the
+      // DOM out from under the user several times a minute.
+      if (!background) render();
     }
   };
 
   await Promise.all(Array.from({ length: CONCURRENCY }, worker));
 
+  render();   // one repaint per cycle, with UI state preserved
   document.querySelectorAll(".view").forEach((v) => v.classList.remove("is-stale"));
   if (failures) setStatus("error", `${failures} refresh${failures === 1 ? "" : "es"} failed — retrying`);
   else setStatus("live", "Live");
 
   const stamp = new Date().toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   $("#updated").textContent = `Updated ${stamp}`;
+  state.refreshing = false;
 }
 
 /* ----------------------------------------------------------------- format -- */
@@ -947,7 +960,34 @@ const openPositionsOf = (t) =>
   (t.rh?.tokens.filter((k) => !k.isCash && (k.value == null || k.value >= RH.dustUsd)).length ?? 0);
 
 /* ============================== RENDER ==================================== */
+/**
+ * Rebuilding the DOM must never cost the reader their place: page scroll,
+ * every table's own scroll, open/closed disclosure state and focus are
+ * captured before the rebuild and restored after it.
+ */
+function captureUiState() {
+  const pageX = window.scrollX, pageY = window.scrollY;
+  const scrolls = [...document.querySelectorAll(".table-scroll")]
+    .map((el, i) => [i, el.scrollLeft, el.scrollTop])
+    .filter(([, l, t]) => l || t);
+  const open = [...document.querySelectorAll("details")].map((d) => d.open);
+  const focusId = document.activeElement?.id || null;
+  return () => {
+    const els = [...document.querySelectorAll(".table-scroll")];
+    for (const [i, l, t] of scrolls) if (els[i]) { els[i].scrollLeft = l; els[i].scrollTop = t; }
+    const ds = [...document.querySelectorAll("details")];
+    open.forEach((o, i) => { if (ds[i]) ds[i].open = o; });
+    if (focusId) document.getElementById(focusId)?.focus?.({ preventScroll: true });
+    window.scrollTo(pageX, pageY);
+  };
+}
+
 function render() {
+  const restore = captureUiState();
+  try { renderInner(); } finally { restore(); }
+}
+
+function renderInner() {
   $("#th-period").textContent = PERIOD_LABEL[state.period];
   if (state.route.view === "trader") {
     $("#view-board").hidden = true;
@@ -1869,22 +1909,23 @@ function wire() {
 
   window.addEventListener("hashchange", onRouteChange);
 
-  // Pause polling when the tab is hidden; refresh immediately on return.
+  // Pause polling when the tab is hidden; refresh quietly on return.
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) stopTimer();
-    else { loadAll(); startTimer(); }
+    else loadAll({ background: true }).then(startTimer);
   });
 }
 
 function startTimer() {
   stopTimer();
-  state.timer = setInterval(() => {
+  state.timer = setTimeout(async () => {
     state.refreshCount++;
-    loadAll({ full: state.refreshCount % RESCAN_EVERY === 0 });
+    await loadAll({ full: state.refreshCount % RESCAN_EVERY === 0, background: true });
+    startTimer();   // next gap starts only after this cycle finished
   }, REFRESH_MS);
 }
 function stopTimer() {
-  if (state.timer) clearInterval(state.timer);
+  if (state.timer) clearTimeout(state.timer);
   state.timer = null;
 }
 
