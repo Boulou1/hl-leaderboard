@@ -7,10 +7,12 @@
 <title>HL Leaderboard</title>
 <meta name="description" content="Live Hyperliquid PnL leaderboard.">
 <link rel="preconnect" href="https://api.hyperliquid.xyz">
+<link rel="preconnect" href="https://robinhoodchain.blockscout.com">
+<link rel="preconnect" href="https://rpc.mainnet.chain.robinhood.com">
 <!-- Bump ?v=N on both assets every deploy: GitHub Pages serves them with
      cache-control max-age=600, so without this a browser runs stale code for
      up to 10 minutes after a push. -->
-<link rel="stylesheet" href="styles.css?v=1">
+<link rel="stylesheet" href="styles.css?v=3">
 </head>
 <body>
 
@@ -19,7 +21,7 @@
     <span class="brand-mark" aria-hidden="true"></span>
     <div>
       <h1>HL Leaderboard</h1>
-      <p class="brand-sub">Hyperliquid &middot; live PnL, positions &amp; fills</p>
+      <p class="brand-sub">Hyperliquid &amp; Robinhood Chain &middot; live PnL, positions &amp; holdings</p>
     </div>
   </div>
   <div class="topbar-right">
@@ -81,10 +83,16 @@
     </div>
 
     <p class="footnote">
-      Equity is Hyperliquid&rsquo;s own account value, aggregated across the main
-      order book and all builder-deployed (HIP&#8209;3) perp DEXes. Spot USDC is the same
-      collateral backing those positions, so it is never added on top.
-      PnL is net of deposits and withdrawals.
+      Not everyone here trades on the same venue, so equity combines two sources.
+      On <strong>Hyperliquid</strong> it is Hyperliquid&rsquo;s own account value across the main
+      order book and all builder-deployed (HIP&#8209;3) perp DEXes; spot USDC is the same
+      collateral backing those positions, so it is never added on top, and PnL there is
+      net of deposits and withdrawals.
+      On <strong>Robinhood Chain</strong> it is the wallet&rsquo;s ETH plus tokens, priced from each
+      token&rsquo;s on-chain DEX pool.
+      PnL is shown as &ldquo;&mdash;&rdquo; for Robinhood Chain holdings: deriving it needs full
+      cross-pool swap history, which no browser-reachable source provides, and a wrong
+      number would be worse than none.
     </p>
   </section>
 
@@ -117,6 +125,15 @@
       </details>
     </div>
 
+    <div class="panel" id="rh-panel" hidden>
+      <div class="panel-head">
+        <h3>Robinhood Chain holdings</h3>
+        <span class="hint" id="rh-count"></span>
+      </div>
+      <div class="table-scroll" id="rh-holdings"></div>
+      <p class="panel-note" id="rh-note"></p>
+    </div>
+
     <div class="panel">
       <div class="panel-head"><h3>Open positions</h3><span class="hint" id="pos-count"></span></div>
       <div class="table-scroll" id="positions"></div>
@@ -131,10 +148,10 @@
 </main>
 
 <footer class="pagefoot">
-  <span>Data: Hyperliquid public API. Read-only, no keys.</span>
+  <span>Data: Hyperliquid API, Robinhood Chain explorer &amp; RPC. Read-only, no keys.</span>
   <span id="updated"></span>
 </footer>
 
-<script type="module" src="app.js?v=1"></script>
+<script type="module" src="app.js?v=3"></script>
 </body>
 </html>

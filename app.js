@@ -27,6 +27,36 @@
 
 const API = "https://api.hyperliquid.xyz/info";
 
+/* ---------------------------------------------------------------------------
+   Robinhood Chain (EVM, chain id 4663).
+
+   Not everyone in this group trades on Hyperliquid -- some trade tokens on
+   Robinhood Chain instead, and a Hyperliquid-only view shows them as unfunded.
+
+   Both sources below send `access-control-allow-origin: *`, so this stays a
+   backend-free static site. BasedBot's API is deliberately NOT used: it sends
+   no CORS header, so a browser cannot call it. Prices are instead derived
+   straight from each token's Uniswap-V3-style pool, which agrees with
+   BasedBot's own price to ~0.3%.
+   --------------------------------------------------------------------------- */
+const RH = {
+  name: "Robinhood Chain",
+  short: "RH Chain",
+  blockscout: "https://robinhoodchain.blockscout.com/api/v2",
+  rpc: "https://rpc.mainnet.chain.robinhood.com",
+  weth: "0x0bd7d308f8e1639fab988df18a8011f41eacad73",
+  // function selectors. Both AMM generations are in use on this chain: V3-style
+  // pools answer slot0(), V2-style pairs revert on it and answer getReserves().
+  sel: {
+    token0: "0x0dfe1681",
+    token1: "0xd21220a7",
+    slot0: "0x3850c7bd",
+    getReserves: "0x0902f1ac",
+  },
+  // Dust threshold: below this a holding is noise, not a position.
+  dustUsd: 0.01,
+};
+
 const TRADERS = [
   { name: "Alberic", address: "0x3df4eb23d7d13e9624c68d7b9c0ec6bb718f0ad0" },
   { name: "Axel",    address: "0x96C19c774bD7D35b1D457492002028DCE719946B" },
@@ -92,6 +122,210 @@ async function loadDexes() {
   return state.dexes;
 }
 
+/* ------------------------------------------------- Robinhood Chain source -- */
+const bsGate = makeGate(4);
+
+async function bsGet(path, retries = 2) {
+  return bsGate(async () => {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const res = await fetch(RH.blockscout + path);
+        if (res.ok) return await res.json();
+        if (res.status !== 429 || attempt >= retries) throw new Error(`blockscout ${res.status}`);
+      } catch (err) {
+        if (attempt >= retries) throw err;
+      }
+      await sleep(400 * (attempt + 1));
+    }
+  });
+}
+
+/**
+ * Tiny concurrency gate. The public RPC throttles bursts, and unlimited
+ * parallelism silently lost prices for whole tokens (they showed "no price"
+ * despite having a perfectly good pool).
+ */
+function makeGate(max) {
+  let active = 0;
+  const waiting = [];
+  const release = () => { active--; waiting.shift()?.(); };
+  return async (fn) => {
+    if (active >= max) await new Promise((r) => waiting.push(r));
+    active++;
+    try { return await fn(); } finally { release(); }
+  };
+}
+const rpcGate = makeGate(6);
+
+async function ethCall(to, data, retries = 2) {
+  return rpcGate(async () => {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const res = await fetch(RH.rpc, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_call", params: [{ to, data }, "latest"] }),
+        });
+        if (res.ok) {
+          const j = await res.json();
+          return j.result && j.result !== "0x" ? j.result : null;
+        }
+        if (attempt >= retries) return null;
+      } catch {
+        if (attempt >= retries) return null;
+      }
+      await sleep(250 * (attempt + 1));
+    }
+  });
+}
+
+/** Tokens repeat across wallets, so pool lookups and prices are cached. */
+const rhPoolCache = new Map();   // token -> {pool, tokenIsToken0} | null
+const rhPriceCache = new Map();  // token -> price in WETH
+
+const addrFromWord = (word) => "0x" + word.slice(-40).toLowerCase();
+
+/**
+ * Find a token's WETH pool. The pool holds most of the float, so it is near the
+ * top of the holder list -- but so is the burn address, hence the contract
+ * filter, and each candidate is confirmed by its token0/token1 pair.
+ */
+async function rhFindPool(token) {
+  const key = token.toLowerCase();
+  if (rhPoolCache.has(key)) return rhPoolCache.get(key);
+
+  let found = null;
+  try {
+    const holders = await bsGet(`/tokens/${token}/holders`);
+    const candidates = (holders.items ?? [])
+      .filter((h) => h.address?.is_contract)
+      .map((h) => h.address.hash)
+      .slice(0, 6);
+
+    // Probe every candidate at once; the pool is usually the first holder, but
+    // testing serially costs a round trip per miss.
+    const probes = await Promise.all(candidates.map(async (cand) => {
+      const [w0, w1] = await Promise.all([ethCall(cand, RH.sel.token0), ethCall(cand, RH.sel.token1)]);
+      if (!w0 || !w1) return null;
+      const a0 = addrFromWord(w0), a1 = addrFromWord(w1);
+      if (a0 === key && a1 === RH.weth) return { pool: cand, tokenIsToken0: true };
+      if (a1 === key && a0 === RH.weth) return { pool: cand, tokenIsToken0: false };
+      return null;
+    }));
+    found = probes.find(Boolean) ?? null;
+  } catch { /* leave found null — the token just won't be priced */ }
+
+  rhPoolCache.set(key, found);
+  return found;
+}
+
+/**
+ * Token price denominated in WETH, read straight from its pool.
+ *
+ * Tries V3 (sqrtPriceX96) first, then falls back to a V2 pair's reserves —
+ * both generations are live on this chain, and assuming V3 silently dropped
+ * whole holdings (Axel's SBS is a V2 pair worth a few hundred dollars).
+ */
+async function rhTokenPriceWeth(token, decimals) {
+  const key = token.toLowerCase();
+  if (rhPriceCache.has(key)) return rhPriceCache.get(key);
+
+  let price = null;
+  const found = await rhFindPool(token);
+
+  if (found) {
+    // token1-per-token0, in human units, whichever shape the pool is.
+    let human = null;
+
+    const slot0 = await ethCall(found.pool, RH.sel.slot0);
+    if (slot0 && slot0.length >= 66) {
+      const sqrtPriceX96 = Number(BigInt("0x" + slot0.slice(2, 66)));
+      if (sqrtPriceX96 > 0) {
+        const r = sqrtPriceX96 / 2 ** 96;
+        const d0 = found.tokenIsToken0 ? decimals : 18;
+        const d1 = found.tokenIsToken0 ? 18 : decimals;
+        human = r * r * 10 ** (d0 - d1);
+      }
+    } else {
+      const res = await ethCall(found.pool, RH.sel.getReserves);
+      if (res && res.length >= 130) {
+        const r0 = Number(BigInt("0x" + res.slice(2, 66)));
+        const r1 = Number(BigInt("0x" + res.slice(66, 130)));
+        const d0 = found.tokenIsToken0 ? decimals : 18;
+        const d1 = found.tokenIsToken0 ? 18 : decimals;
+        const h0 = r0 / 10 ** d0, h1 = r1 / 10 ** d1;
+        if (h0 > 0 && h1 > 0) human = h1 / h0;
+      }
+    }
+
+    if (human != null && human > 0 && Number.isFinite(human)) {
+      price = found.tokenIsToken0 ? human : 1 / human;
+    }
+  }
+
+  rhPriceCache.set(key, price);
+  return price;
+}
+
+/**
+ * Holdings + USD value for one wallet on Robinhood Chain.
+ *
+ * Deliberately returns no PnL: realised PnL needs full cross-pool swap history,
+ * and the only source for that (BasedBot) is not reachable from a browser. A
+ * wrong PnL is worse than an absent one, so the UI shows value and marks PnL
+ * as unavailable for this venue.
+ */
+async function loadRobinhood(address) {
+  const [summary, balances] = await Promise.all([
+    bsGet(`/addresses/${address}`).catch(() => null),
+    bsGet(`/addresses/${address}/token-balances`).catch(() => null),
+  ]);
+  if (!summary) return null;
+
+  const ethUsd = num(summary.exchange_rate);
+  const nativeQty = num(summary.coin_balance) / 1e18;
+  const nativeUsd = nativeQty * ethUsd;
+
+  const rawList = Array.isArray(balances) ? balances : (balances?.items ?? []);
+
+  // Price every holding concurrently — serially this is a round trip per token
+  // per pool candidate, which visibly stalls the whole page.
+  const tokens = (await Promise.all(rawList.map(async (b) => {
+    const t = b.token ?? {};
+    const addr = t.address_hash ?? t.address;
+    if (!addr) return null;
+    const decimals = parseInt(t.decimals ?? "18", 10) || 18;
+    const qty = num(b.value) / 10 ** decimals;
+    if (qty <= 0) return null;
+
+    // Blockscout prices a few tokens itself; derive the rest from the pool.
+    let usd = num(t.exchange_rate);
+    let source = usd > 0 ? "blockscout" : null;
+    if (!source) {
+      const weth = await rhTokenPriceWeth(addr, decimals);
+      if (weth != null && ethUsd > 0) { usd = weth * ethUsd; source = "pool"; }
+    }
+
+    return {
+      symbol: t.symbol || "?", name: t.name || "", address: addr,
+      qty, priceUsd: source ? usd : null, value: source ? qty * usd : null, source,
+    };
+  }))).filter(Boolean);
+
+  tokens.sort((a, b) => (b.value ?? -1) - (a.value ?? -1));
+
+  const tokenValue = tokens.reduce((s, t) => s + (t.value ?? 0), 0);
+  const unpriced = tokens.filter((t) => t.value == null).length;
+
+  return {
+    ethUsd, nativeQty, nativeUsd, tokens, tokenValue,
+    total: nativeUsd + tokenValue,
+    unpriced,
+    // "Used at all?" — distinguishes a real wallet from an untouched address.
+    active: nativeQty > 0 || tokens.length > 0,
+  };
+}
+
 /* --------------------------------------------------------------- fetching -- */
 /**
  * Load one trader. `knownDexes` limits the position scan on light refreshes;
@@ -100,9 +334,10 @@ async function loadDexes() {
 async function loadTrader(trader, knownDexes) {
   const dexes = knownDexes ?? (await loadDexes());
 
-  const [portfolio, fills, ...states] = await Promise.all([
+  const [portfolio, fills, rh, ...states] = await Promise.all([
     info({ type: "portfolio", user: trader.address }),
     info({ type: "userFills", user: trader.address }),
+    loadRobinhood(trader.address).catch(() => null),
     ...dexes.map((dex) =>
       info(dex ? { type: "clearinghouseState", user: trader.address, dex }
                : { type: "clearinghouseState", user: trader.address })
@@ -146,14 +381,21 @@ async function loadTrader(trader, knownDexes) {
     };
   }
 
-  const equity = periods.allTime.avHist.length
+  const hlEquity = periods.allTime.avHist.length
     ? periods.allTime.avHist[periods.allTime.avHist.length - 1][1]
     : venues.reduce((s, v) => s + v.equity, 0);
+
+  // Hyperliquid and Robinhood Chain are genuinely separate pools of money, so
+  // unlike perp-vs-spot within Hyperliquid these DO add up.
+  const rhValue = rh?.active ? rh.total : 0;
+  const equity = hlEquity + rhValue;
 
   return {
     ...trader,
     ok: true,
     equity,
+    hlEquity,
+    rh: rh?.active ? rh : null,
     unrealised,
     realised,
     feesPaid,
@@ -161,6 +403,9 @@ async function loadTrader(trader, knownDexes) {
     venues,
     fills: fillRows,
     periods,
+    // PnL is only sourced for the Hyperliquid side; flag when equity exceeds
+    // what that PnL actually covers so the leaderboard can say so.
+    pnlCoversAll: rhValue === 0,
     // "never traded anywhere" — distinct from "traded and went flat"
     isEmpty: equity === 0 && positions.length === 0 && fillRows.length === 0,
     dexesScanned: dexes,
@@ -174,25 +419,36 @@ async function loadAll({ full = false } = {}) {
   await loadDexes();
   let failures = 0;
 
-  // Sequential-with-small-batches: keeps well inside the info-endpoint rate
-  // limit while still loading fast (7 traders x ~12 calls).
-  for (const trader of TRADERS) {
-    const prev = state.byAddress.get(trader.address);
-    const known = full || !prev?.dexesScanned
-      ? null
-      : dedupe(["", ...prev.venues.map((v) => v.dex)]);
-    try {
-      state.byAddress.set(trader.address, await loadTrader(trader, known));
-    } catch (err) {
-      failures++;
-      state.byAddress.set(trader.address, {
-        ...trader, ok: false, error: String(err.message || err),
-        equity: 0, unrealised: 0, realised: 0, positions: [], venues: [],
-        fills: [], periods: {}, isEmpty: false,
-      });
+  // Bounded concurrency: fully sequential is slow now that each trader also
+  // does Robinhood Chain lookups, but unbounded would trip the Hyperliquid
+  // rate limit. Rows still appear as each trader resolves.
+  const CONCURRENCY = 3;
+  const queue = [...TRADERS];
+
+  const worker = async () => {
+    for (;;) {
+      const trader = queue.shift();
+      if (!trader) return;
+      const prev = state.byAddress.get(trader.address);
+      const known = full || !prev?.dexesScanned
+        ? null
+        : dedupe(["", ...prev.venues.map((v) => v.dex)]);
+      try {
+        state.byAddress.set(trader.address, await loadTrader(trader, known));
+      } catch (err) {
+        failures++;
+        state.byAddress.set(trader.address, {
+          ...trader, ok: false, error: String(err.message || err),
+          equity: 0, hlEquity: 0, rh: null, unrealised: 0, realised: 0,
+          positions: [], venues: [], fills: [], periods: {},
+          isEmpty: false, pnlCoversAll: true,
+        });
+      }
+      render();
     }
-    render();
-  }
+  };
+
+  await Promise.all(Array.from({ length: CONCURRENCY }, worker));
 
   document.querySelectorAll(".view").forEach((v) => v.classList.remove("is-stale"));
   if (failures) setStatus("error", `${failures} of ${TRADERS.length} failed`);
@@ -355,7 +611,10 @@ function renderGroupTiles() {
   const volume = active.reduce((s, t) => s + periodOf(t).volume, 0);
   const openPos = active.reduce((s, t) => s + t.positions.length, 0);
 
-  const ranked = [...active].sort((a, b) => periodOf(b).pnl - periodOf(a).pnl);
+  // Only traders with a real PnL figure can be "best" or "worst".
+  const withPnl = active.filter((t) => t.pnlCoversAll || t.hlEquity > 0 || t.fills.length);
+  const rhOnly = active.filter((t) => !(t.pnlCoversAll || t.hlEquity > 0 || t.fills.length));
+  const ranked = [...withPnl].sort((a, b) => periodOf(b).pnl - periodOf(a).pnl);
   const best = ranked[0];
   const worst = ranked.length > 1 ? ranked[ranked.length - 1] : null;
 
@@ -364,7 +623,9 @@ function renderGroupTiles() {
     tile("Group equity", el("span", { text: rows.length ? compactUsd(equity) : "—" }),
       `${active.length} of ${TRADERS.length} funded`),
     tile(`Group PnL · ${PERIOD_LABEL[state.period]}`, delta(pnl),
-      `${openPos} open position${openPos === 1 ? "" : "s"}`),
+      rhOnly.length
+        ? `Hyperliquid only — excludes ${rhOnly.map((t) => t.name).join(", ")}`
+        : `${openPos} open position${openPos === 1 ? "" : "s"}`),
     tile("Top performer",
       best ? el("span", { text: best.name }) : el("span", { class: "hint", text: "—" }),
       best ? `${signedUsd(periodOf(best).pnl)} · ${pct(roiOf(best))}` : "no activity yet"),
@@ -394,12 +655,18 @@ function renderBoard() {
   const loaded = rows.filter((t) => !t.pending);
   const pending = rows.filter((t) => t.pending);
 
-  // Never-funded accounts always sort last: they are not "worst", just absent.
+  // Three bands, in order: traders with a real PnL figure, then traders who are
+  // funded but have no PnL source (Robinhood-Chain-only), then never-funded.
+  // A missing PnL is not a zero and must not rank as one.
   const funded = loaded.filter((t) => t.ok && !t.isEmpty);
   const rest = loaded.filter((t) => !(t.ok && !t.isEmpty));
-  funded.sort((a, b) => (dir === "asc" ? get(a) - get(b) : get(b) - get(a)));
+  const hasPnl = (t) => t.pnlCoversAll || t.hlEquity > 0 || t.fills.length > 0;
+  const ranked = funded.filter(hasPnl);
+  const unranked = funded.filter((t) => !hasPnl(t));
+  ranked.sort((a, b) => (dir === "asc" ? get(a) - get(b) : get(b) - get(a)));
+  unranked.sort((a, b) => b.equity - a.equity);
 
-  const ordered = [...funded, ...rest, ...pending];
+  const ordered = [...ranked, ...unranked, ...rest, ...pending];
 
   body.replaceChildren(...ordered.map((t, i) => boardRow(t, i)));
 
@@ -455,9 +722,10 @@ function boardRow(t, index) {
   });
 
   // "Idle" = funded but flat, which reports as no venue on every clearinghouse.
-  const venueTags = t.venues.length
+  const hlTags = t.venues.length
     ? dedupe(t.venues.map((v) => dexLabel(v.dex)))
-    : t.equity > 0 ? ["Idle"] : [];
+    : t.hlEquity > 0 ? ["Idle"] : [];
+  const venueTags = [...hlTags, ...(t.rh ? [RH.short] : [])];
 
   tr.append(
     el("td", { class: "col-rank", text: isEmpty ? "–" : String(index + 1) }),
@@ -477,15 +745,30 @@ function boardRow(t, index) {
     return tr;
   }
 
+  // A trader holding only Robinhood Chain tokens has real equity but no PnL
+  // source, so show "—" rather than a misleading 0.
+  const noPnl = !t.pnlCoversAll && t.hlEquity === 0 && !t.fills.length;
+  const naCell = () => el("td", { class: "num" }, [
+    el("span", { class: "hint", attrs: { title: "No PnL source for Robinhood Chain holdings" }, text: "—" }),
+  ]);
+
+  tr.append(el("td", { class: "num", text: usd(t.equity) }));
+
+  if (noPnl) {
+    tr.append(naCell(), naCell(), naCell(), naCell());
+  } else {
+    tr.append(
+      el("td", { class: "num" }, [delta(p.pnl)]),
+      el("td", { class: "num" }, [el("span", { class: `delta ${dirClass(p.pnl)}`, text: pct(roiOf(t)) })]),
+      el("td", { class: "num" }, [delta(t.unrealised)]),
+      el("td", { class: "num" }, [delta(t.realised)]),
+    );
+  }
+
   tr.append(
-    el("td", { class: "num", text: usd(t.equity) }),
-    el("td", { class: "num" }, [delta(p.pnl)]),
-    el("td", { class: "num" }, [el("span", { class: `delta ${dirClass(p.pnl)}`, text: pct(roiOf(t)) })]),
-    el("td", { class: "num" }, [delta(t.unrealised)]),
-    el("td", { class: "num" }, [delta(t.realised)]),
     el("td", { class: "num", text: compactUsd(p.volume) }),
-    el("td", { class: "num", text: String(t.positions.length) }),
-    el("td", { class: "col-spark" }, [sparkline(p.pnlHist)]),
+    el("td", { class: "num", text: String(t.positions.length + (t.rh?.tokens.length ?? 0)) }),
+    el("td", { class: "col-spark" }, [noPnl ? el("span", { class: "hint", text: "—" }) : sparkline(p.pnlHist)]),
   );
 
   if (venueTags.length) tr.querySelector(".trader-cell > div").append(
@@ -566,9 +849,13 @@ function renderTrader() {
   $("#t-name").textContent = t.name;
   $("#t-addr").textContent = shortAddr(t.address);
 
+  const detailTags = [
+    ...dedupe(t.venues.map((v) => dexLabel(v.dex))),
+    ...(t.rh ? [RH.short] : []),
+  ];
   $("#t-venues").replaceChildren(
-    ...(t.venues.length
-      ? dedupe(t.venues.map((v) => dexLabel(v.dex))).map((d) => el("span", { class: "tag", text: d }))
+    ...(detailTags.length
+      ? detailTags.map((d) => el("span", { class: "tag", text: d }))
       : [el("span", { class: "tag", text: "no venue" })]),
   );
 
@@ -585,27 +872,107 @@ function renderTrader() {
 
   // With no open position the collateral sits free in spot and every perp
   // clearinghouse reports 0, so "no venue" must not be read as "no money".
-  const equitySub = t.venues.length
-    ? t.venues.map((v) => `${dexLabel(v.dex)} ${usd(v.equity)}`).join(" · ")
+  const parts = t.venues.map((v) => `${dexLabel(v.dex)} ${usd(v.equity)}`);
+  if (t.rh) parts.push(`${RH.short} ${usd(t.rh.total)}`);
+  const equitySub = parts.length
+    ? parts.join(" · ")
     : t.equity > 0
       ? "idle collateral — no open position"
       : "not funded";
 
+  // No Hyperliquid footprint at all -> the PnL tiles have no source. Showing
+  // "$0.00" would read as "flat", which is a different claim from "unknown".
+  const hasHl = t.hlEquity > 0 || t.fills.length > 0 || t.positions.length > 0;
+  const naTile = (label, sub) => tile(label, el("span", { class: "hint", text: "—" }), sub);
+
   $("#t-tiles").replaceChildren(
     tile("Equity", el("span", { text: usd(t.equity) }), equitySub),
-    tile(`PnL · ${PERIOD_LABEL[state.period]}`, delta(p.pnl), pct(roiOf(t)) + " on starting equity"),
-    tile("Unrealised", delta(t.unrealised),
-      `${t.positions.length} open position${t.positions.length === 1 ? "" : "s"}`),
-    tile("Realised", delta(t.realised), `net of ${usd(t.feesPaid)} fees`),
-    tile("Realised + unrealised", delta(totalPnl), "lifetime, from fills"),
-    tile(`Volume · ${PERIOD_LABEL[state.period]}`, el("span", { text: compactUsd(p.volume) }),
-      `${t.fills.length} fill${t.fills.length === 1 ? "" : "s"}`),
+    hasHl
+      ? tile(`PnL · ${PERIOD_LABEL[state.period]}`, delta(p.pnl), pct(roiOf(t)) + " on starting equity")
+      : naTile(`PnL · ${PERIOD_LABEL[state.period]}`, "no PnL source for this venue"),
+    hasHl
+      ? tile("Unrealised", delta(t.unrealised),
+          `${t.positions.length} open position${t.positions.length === 1 ? "" : "s"}`)
+      : naTile("Unrealised", "needs cross-pool swap history"),
+    hasHl
+      ? tile("Realised", delta(t.realised), `net of ${usd(t.feesPaid)} fees`)
+      : naTile("Realised", "needs cross-pool swap history"),
+    hasHl
+      ? tile("Realised + unrealised", delta(totalPnl), "lifetime, from fills")
+      : naTile("Realised + unrealised", "—"),
+    hasHl
+      ? tile(`Volume · ${PERIOD_LABEL[state.period]}`, el("span", { text: compactUsd(p.volume) }),
+          `${t.fills.length} fill${t.fills.length === 1 ? "" : "s"}`)
+      : tile("Holdings", el("span", { text: String(t.rh?.tokens.length ?? 0) }), "tokens on " + RH.short),
   );
 
   renderChart(t);
+  renderRobinhood(t);
   renderPositions(t);
   renderFills(t);
 }
+
+/* -------------------------------------------------- Robinhood Chain panel -- */
+function renderRobinhood(t) {
+  const panel = $("#rh-panel");
+  const rh = t.rh;
+
+  if (!rh) { panel.hidden = true; return; }
+  panel.hidden = false;
+
+  $("#rh-count").textContent =
+    `${usd(rh.total)} total · ${rh.tokens.length} token${rh.tokens.length === 1 ? "" : "s"}`;
+
+  const tbl = el("table", { class: "grid" });
+  const head = ["Asset", "Quantity", "Price", "Value", "Share", "Price source"];
+  tbl.append(el("thead", {}, [el("tr", {}, head.map((h, i) =>
+    el("th", { class: i >= 1 && i <= 4 ? "num" : "", attrs: { scope: "col" }, text: h })))]));
+
+  const body = [];
+
+  // native ETH first — usually the largest single holding
+  if (rh.nativeQty > 0) {
+    body.push(el("tr", {}, [
+      el("td", {}, [el("strong", { text: "ETH" }), el("span", { class: "tag", text: "native" })]),
+      el("td", { class: "num", text: rh.nativeQty.toLocaleString(undefined, { maximumFractionDigits: 6 }) }),
+      el("td", { class: "num", text: usd(rh.ethUsd) }),
+      el("td", { class: "num", text: usd(rh.nativeUsd) }),
+      el("td", { class: "num", text: rh.total > 0 ? pctPlain(rh.nativeUsd / rh.total * 100) : "—" }),
+      el("td", {}, [el("span", { class: "hint", text: "explorer" })]),
+    ]));
+  }
+
+  for (const tok of rh.tokens) {
+    const priced = tok.value != null;
+    body.push(el("tr", { class: priced && tok.value < RH.dustUsd ? "is-dust" : "" }, [
+      el("td", {}, [
+        el("strong", { text: tok.symbol }),
+        tok.name && tok.name !== tok.symbol ? el("span", { class: "sub-name", text: tok.name }) : null,
+      ]),
+      el("td", { class: "num", text: tok.qty.toLocaleString(undefined, { maximumFractionDigits: 4 }) }),
+      el("td", { class: "num", text: priced ? "$" + tok.priceUsd.toPrecision(4) : "—" }),
+      el("td", { class: "num", text: priced ? usd(tok.value) : "—" }),
+      el("td", { class: "num", text: priced && rh.total > 0 ? pctPlain(tok.value / rh.total * 100) : "—" }),
+      el("td", {}, [el("span", {
+        class: "hint",
+        text: tok.source === "pool" ? "DEX pool" : tok.source === "blockscout" ? "explorer" : "no price",
+      })]),
+    ]));
+  }
+
+  tbl.append(el("tbody", {}, body));
+  $("#rh-holdings").replaceChildren(tbl);
+
+  const bits = [
+    "Prices are read from each token's on-chain DEX pool — V3 spot price or V2 reserves — or from the explorer where it has one.",
+    "Profit and loss is not shown for this venue: it needs full cross-pool swap history, which no browser-reachable source provides — a wrong figure would be worse than none.",
+  ];
+  if (rh.unpriced) bits.push(`${rh.unpriced} token${rh.unpriced === 1 ? "" : "s"} had no pool and could not be valued.`);
+  $("#rh-note").textContent = bits.join(" ");
+}
+
+/** Percentage without a +/- sign — for shares of a total, which are never negative. */
+const pctPlain = (n) => `${n.toFixed(1)}%`;
 
 /* ------------------------------------------------------------------ chart -- */
 function renderChart(t) {
@@ -620,13 +987,17 @@ function renderChart(t) {
   const wrap = $("#chart-wrap");
   const tableBox = $("#chart-table");
 
-  // A never-funded account still gets a full all-zero history back; plotting a
-  // flat line on a +/-$1 axis is noise, so say so instead.
+  // Hyperliquid returns a full all-zero history even for accounts that never
+  // used it, so plotting a flat line on a +/-$1 axis is noise. This chart is
+  // Hyperliquid-only; a Robinhood-Chain trader has nothing to plot here.
   const allZero = (hist ?? []).every(([, v]) => num(v) === 0);
-  if (!hist || hist.length < 2 || (t.isEmpty && allZero)) {
+  const noHl = t.hlEquity === 0 && !t.fills.length && !t.positions.length;
+  if (!hist || hist.length < 2 || (allZero && (t.isEmpty || noHl))) {
     wrap.replaceChildren(el("div", { class: "empty",
-      text: t.isEmpty ? "Nothing to chart — this wallet has never been funded."
-                      : "No history for this range yet." }));
+      text: t.rh
+        ? `No Hyperliquid history — this wallet trades on ${RH.name}. See holdings below.`
+        : t.isEmpty ? "Nothing to chart — this wallet has never been funded."
+                    : "No history for this range yet." }));
     tableBox.replaceChildren();
     return;
   }

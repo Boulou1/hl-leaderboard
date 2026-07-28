@@ -1,7 +1,12 @@
 # HL Leaderboard
 
-A live PnL leaderboard for a group of Hyperliquid wallets. Click any trader to see
-their open positions, realised/unrealised PnL, and full trade history.
+A live leaderboard for a group of wallets across **two venues** — Hyperliquid perps
+and Robinhood Chain tokens. Click any trader for their positions, PnL and trades
+(Hyperliquid) or their token holdings and value (Robinhood Chain).
+
+The group does not all trade in one place, which is the main thing this dashboard
+has to get right: a Hyperliquid-only view shows the Robinhood Chain traders as
+completely unfunded.
 
 **Live:** https://boulou1.github.io/hl-leaderboard/
 
@@ -61,6 +66,42 @@ where the same amount appears negative). It is displayed as a cost.
 
 `pnlHistory` is rebased to zero at the start of each period, so its last point is
 the period PnL, already net of deposits and withdrawals.
+
+## Robinhood Chain (chain id 4663)
+
+Balances come from the [Blockscout explorer](https://robinhoodchain.blockscout.com)
+and prices are read straight from each token's on-chain DEX pool via the public RPC.
+Both send `access-control-allow-origin: *`, so this stays a static site.
+
+**Why not BasedBot?** `basedbot.app/api` is public and has exactly the right data
+(pool addresses, prices, and per-wallet trades via `?maker=`), but it sends **no
+CORS header** on either the GET or the OPTIONS preflight — verified on
+`/api/prices` and `/api/token/{t}/trades`. A browser on a different origin cannot
+read the response, so it is unusable from a static page. Pricing from the pool
+directly agrees with BasedBot's own price to ~0.3% and has no third-party
+dependency.
+
+**Both AMM generations are live on this chain.** V3-style pools answer `slot0()`;
+V2-style pairs revert on it and answer `getReserves()`. Assuming V3 silently
+dropped whole holdings — Axel's SBS is a V2 pair worth a few hundred dollars and
+showed as "no price" until the fallback was added.
+
+Pools are found by taking the token's top holders from the explorer, keeping the
+contracts (the burn address is often holder #1), and confirming each candidate's
+`token0()`/`token1()` pair against WETH.
+
+### No PnL for this venue — on purpose
+
+The dashboard shows Robinhood Chain **value**, and `—` for PnL. Realised PnL needs
+complete swap history, and BasedBot's trades endpoint is **pool-scoped**, so its
+history is partial by construction: Axel's SBS returns 27 sells against 1 buy — he
+appears to have sold 20.9M more than he bought, which produced a plausible-looking
+but entirely wrong "−$1,551 realised" in an early draft.
+
+Full history *is* reconstructable from Blockscout (`/addresses/{a}/token-transfers`
+joined with native value and internal transactions, per tx hash) and that is the
+correct way to add real PnL here. Until that exists, no number is shown rather
+than a wrong one.
 
 ## Accessibility
 
