@@ -252,7 +252,8 @@ tr.is-empty td { color: var(--text-muted); }
 }
 .tag + .tag { margin-left: 4px; }
 /* a tag following inline content needs its own gap, not just tag-to-tag */
-strong + .tag { margin-left: 6px; }
+strong + .tag, .sub-name + .tag { margin-left: 6px; }
+.sub-name + .tag { margin-left: 0; margin-top: 3px; }
 
 /* signed values — arrow + sign so colour is never the only channel */
 .delta { font-variant-numeric: tabular-nums; font-family: var(--mono); }
@@ -369,3 +370,7 @@ tr.is-dust td { opacity: 0.5; }
   table.grid th, table.grid td { padding: 9px 8px; }
   .col-spark { width: 72px; }
 }
+
+/* fully-exited positions: shown for their realised PnL, but recessive */
+tr.is-closed td { color: var(--text-muted); }
+tr.is-closed strong { color: var(--text-secondary); font-weight: 500; }

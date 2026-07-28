@@ -267,13 +267,174 @@ async function rhTokenPriceWeth(token, decimals) {
   return price;
 }
 
+/** Walk Blockscout's next_page_params until exhausted. */
+async function bsPaged(path, maxPages = 12) {
+  const out = [];
+  let params = null;
+  for (let page = 0; page < maxPages; page++) {
+    const qs = params
+      ? (path.includes("?") ? "&" : "?") +
+        Object.entries(params).filter(([, v]) => v != null)
+          .map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&")
+      : "";
+    let d;
+    try { d = await bsGet(path + qs); } catch { break; }
+    const items = d.items ?? [];
+    out.push(...items);
+    if (!items.length || !d.next_page_params) break;
+    params = d.next_page_params;
+  }
+  return out;
+}
+
 /**
- * Holdings + USD value for one wallet on Robinhood Chain.
+ * Rebuild every swap this wallet made on Robinhood Chain from on-chain data,
+ * and derive cost basis, realised and unrealised PnL.
  *
- * Deliberately returns no PnL: realised PnL needs full cross-pool swap history,
- * and the only source for that (BasedBot) is not reachable from a browser. A
- * wrong PnL is worse than an absent one, so the UI shows value and marks PnL
- * as unavailable for this venue.
+ * Accounting is in ETH — the actual quote asset of every pool here. Blockscout
+ * returns `historic_exchange_rate: null`, so there is no trustworthy per-trade
+ * USD rate; ETH-denominated PnL is exact and is converted at the current rate
+ * only for display.
+ *
+ * A swap is a transaction where tokens move one way and native ETH the other:
+ * buys carry ETH in the transaction's `value`, sells receive ETH back as an
+ * internal transaction from the router.
+ *
+ * Two honesty guards, both learned the hard way:
+ *  - Reconstructed quantity is checked against the wallet's real balance. If it
+ *    disagrees the history is incomplete and PnL is withheld. (BasedBot's
+ *    pool-scoped feed failed exactly this test: 27 sells against 1 buy.)
+ *  - Tokens that arrived as plain transfers (airdrops) have unknown cost, not
+ *    zero cost. Counting them as free manufactures profit, so their proceeds
+ *    are reported separately and excluded from realised PnL.
+ */
+async function rhSwaps(address) {
+  const me = address.toLowerCase();
+  const [transfers, txs, internals] = await Promise.all([
+    bsPaged(`/addresses/${address}/token-transfers?type=ERC-20`),
+    bsPaged(`/addresses/${address}/transactions`),
+    bsPaged(`/addresses/${address}/internal-transactions`),
+  ]);
+
+  // native ETH spent by us, plus total gas
+  const ethOut = new Map();
+  let gasEth = 0;
+  for (const t of txs) {
+    if ((t.from?.hash ?? "").toLowerCase() !== me) continue;
+    ethOut.set(t.hash, (ethOut.get(t.hash) ?? 0) + num(t.value) / 1e18);
+    gasEth += num(t.fee?.value) / 1e18;
+  }
+
+  // native ETH paid to us (sell proceeds arrive this way)
+  const ethIn = new Map();
+  for (const it of internals) {
+    if ((it.to?.hash ?? "").toLowerCase() !== me) continue;
+    if (it.success === false) continue;
+    const h = it.transaction_hash;
+    ethIn.set(h, (ethIn.get(h) ?? 0) + num(it.value) / 1e18);
+  }
+
+  // token movements per transaction
+  const perTx = new Map();   // hash -> { sort, tokens: Map(addr -> qty) }
+  const tokenMeta = new Map();
+  for (const x of transfers) {
+    const tk = x.token ?? {};
+    const ta = (tk.address_hash ?? tk.address ?? "").toLowerCase();
+    if (!ta) continue;
+    const decimals = parseInt(tk.decimals ?? "18", 10) || 18;
+    tokenMeta.set(ta, { symbol: tk.symbol || "?", name: tk.name || "", decimals });
+
+    const raw = (x.total && typeof x.total === "object") ? x.total.value : x.value;
+    const amt = num(raw) / 10 ** decimals;
+    if (!amt) continue;
+
+    const h = x.transaction_hash;
+    if (!perTx.has(h)) {
+      perTx.set(h, {
+        sort: [num(x.block_number), num(x.log_index)],
+        ts: Date.parse(x.timestamp) || 0,
+        tokens: new Map(),
+      });
+    }
+    const rec = perTx.get(h);
+    const to = (x.to?.hash ?? "").toLowerCase();
+    const frm = (x.from?.hash ?? "").toLowerCase();
+    const signed = to === me ? amt : frm === me ? -amt : 0;
+    if (signed) rec.tokens.set(ta, (rec.tokens.get(ta) ?? 0) + signed);
+  }
+
+  // oldest first, so cost basis accumulates in the right order
+  const order = [...perTx.entries()].sort((a, b) =>
+    a[1].sort[0] - b[1].sort[0] || a[1].sort[1] - b[1].sort[1]);
+
+  const books = new Map();   // token -> ledger
+  const blank = () => ({
+    qty: 0, costEth: 0, realisedEth: 0, buys: 0, sells: 0,
+    uncostedIn: 0, uncostedProceedsEth: 0,
+  });
+  // Timestamped so the range selector can scope this venue too.
+  const realisedEvents = [];
+  const volumeEvents = [];   // every swap's ETH notional
+  const trades = [];
+  let deployedEth = 0;       // gross ETH ever spent buying — the capital at risk
+
+  for (const [hash, rec] of order) {
+    const inEth = ethIn.get(hash) ?? 0;
+    const outEth = ethOut.get(hash) ?? 0;
+    for (const [ta, dq] of rec.tokens) {
+      if (!books.has(ta)) books.set(ta, blank());
+      const b = books.get(ta);
+      const sym = tokenMeta.get(ta)?.symbol ?? "?";
+
+      if (dq > 0) {
+        if (outEth > 0) {
+          b.qty += dq; b.costEth += outEth; b.buys++;
+          deployedEth += outEth;
+          volumeEvents.push({ ts: rec.ts, eth: outEth });
+          trades.push({ ts: rec.ts, symbol: sym, side: "Buy", qty: dq, eth: outEth, token: ta });
+        } else {
+          b.qty += dq; b.uncostedIn++;               // airdrop / incoming transfer
+          trades.push({ ts: rec.ts, symbol: sym, side: "Received", qty: dq, eth: 0, token: ta });
+        }
+      } else if (dq < 0) {
+        const amt = -dq;
+        const avg = b.qty > 0 ? b.costEth / b.qty : 0;
+        if (inEth > 0) {
+          volumeEvents.push({ ts: rec.ts, eth: inEth });
+          if (b.uncostedIn > 0) {
+            b.uncostedProceedsEth += inEth;          // cost unknown, not zero
+            trades.push({ ts: rec.ts, symbol: sym, side: "Sell", qty: amt, eth: inEth,
+                          token: ta, pnlEth: null });
+          } else {
+            const r = inEth - avg * amt;
+            b.realisedEth += r; b.sells++;
+            realisedEvents.push({ ts: rec.ts, eth: r });
+            trades.push({ ts: rec.ts, symbol: sym, side: "Sell", qty: amt, eth: inEth,
+                          token: ta, pnlEth: r });
+          }
+        } else {
+          trades.push({ ts: rec.ts, symbol: sym, side: "Sent", qty: amt, eth: 0, token: ta });
+        }
+        b.qty -= amt;
+        b.costEth -= avg * amt;
+        if (b.qty < 1e-12) { b.qty = 0; b.costEth = 0; }
+      }
+    }
+  }
+
+  // gas, with timestamps, so it can be scoped the same way
+  const gasEvents = txs
+    .filter((t) => (t.from?.hash ?? "").toLowerCase() === me)
+    .map((t) => ({ ts: Date.parse(t.timestamp) || 0, eth: num(t.fee?.value) / 1e18 }));
+
+  trades.sort((a, b) => b.ts - a.ts);
+
+  return { books, tokenMeta, gasEth, realisedEvents, gasEvents, volumeEvents, trades,
+           deployedEth, txCount: txs.length, transferCount: transfers.length };
+}
+
+/**
+ * Holdings, value and PnL for one wallet on Robinhood Chain.
  */
 async function loadRobinhood(address) {
   const [summary, balances] = await Promise.all([
@@ -287,6 +448,15 @@ async function loadRobinhood(address) {
   const nativeUsd = nativeQty * ethUsd;
 
   const rawList = Array.isArray(balances) ? balances : (balances?.items ?? []);
+
+  // Nothing here at all — skip the (expensive) swap reconstruction entirely.
+  if (nativeQty === 0 && rawList.length === 0) {
+    return { ethUsd, nativeQty: 0, nativeUsd: 0, tokens: [], closed: [], tokenValue: 0,
+             total: 0, unpriced: 0, active: false, realisedEth: 0, unrealisedEth: 0,
+             gasEth: 0, uncostedProceedsEth: 0, verified: true, txCount: 0 };
+  }
+
+  const swaps = await rhSwaps(address).catch(() => null);
 
   // Price every holding concurrently — serially this is a round trip per token
   // per pool candidate, which visibly stalls the whole page.
@@ -306,9 +476,20 @@ async function loadRobinhood(address) {
       if (weth != null && ethUsd > 0) { usd = weth * ethUsd; source = "pool"; }
     }
 
+    const book = swaps?.books.get(addr.toLowerCase());
+    // Does the swap history actually account for what the wallet holds?
+    const verified = book ? Math.abs(book.qty - qty) <= Math.max(1e-6, qty * 0.005) : false;
+    const costEth = book && verified && !book.uncostedIn ? book.costEth : null;
+    const valueEth = source && ethUsd > 0 ? (qty * usd) / ethUsd : null;
+
     return {
       symbol: t.symbol || "?", name: t.name || "", address: addr,
       qty, priceUsd: source ? usd : null, value: source ? qty * usd : null, source,
+      costEth, valueEth,
+      unrealisedEth: costEth != null && valueEth != null ? valueEth - costEth : null,
+      realisedEth: book && !book.uncostedIn ? book.realisedEth : null,
+      uncosted: !!book?.uncostedIn,
+      verified,
     };
   }))).filter(Boolean);
 
@@ -317,12 +498,44 @@ async function loadRobinhood(address) {
   const tokenValue = tokens.reduce((s, t) => s + (t.value ?? 0), 0);
   const unpriced = tokens.filter((t) => t.value == null).length;
 
+  // Positions closed out entirely: they hold no balance now, so they never
+  // appear in token-balances, yet they carry most of the realised PnL.
+  const held = new Set(tokens.map((t) => t.address.toLowerCase()));
+  const closed = [];
+  let realisedEth = 0;
+  let uncostedProceedsEth = 0;
+
+  for (const [ta, b] of swaps?.books ?? []) {
+    if (b.uncostedIn) { uncostedProceedsEth += b.uncostedProceedsEth; continue; }
+    realisedEth += b.realisedEth;
+    if (!held.has(ta) && b.sells > 0) {
+      const meta = swaps.tokenMeta.get(ta) ?? {};
+      closed.push({
+        symbol: meta.symbol || "?", name: meta.name || "", address: ta,
+        realisedEth: b.realisedEth, buys: b.buys, sells: b.sells,
+      });
+    }
+  }
+  closed.sort((a, b) => b.realisedEth - a.realisedEth);
+
+  const unrealisedEth = tokens.reduce((s, t) => s + (t.unrealisedEth ?? 0), 0);
+  const gasEth = swaps?.gasEth ?? 0;
+
   return {
-    ethUsd, nativeQty, nativeUsd, tokens, tokenValue,
+    ethUsd, nativeQty, nativeUsd, tokens, closed, tokenValue,
     total: nativeUsd + tokenValue,
     unpriced,
     // "Used at all?" — distinguishes a real wallet from an untouched address.
     active: nativeQty > 0 || tokens.length > 0,
+    realisedEth, unrealisedEth, gasEth, uncostedProceedsEth,
+    realisedEvents: swaps?.realisedEvents ?? [],
+    gasEvents: swaps?.gasEvents ?? [],
+    volumeEvents: swaps?.volumeEvents ?? [],
+    trades: swaps?.trades ?? [],
+    deployedEth: swaps?.deployedEth ?? 0,
+    // PnL is only shown when the reconstruction reproduces every held balance.
+    verified: !!swaps && tokens.every((t) => t.verified || t.value == null),
+    txCount: swaps?.txCount ?? 0,
   };
 }
 
@@ -387,27 +600,36 @@ async function loadTrader(trader, knownDexes) {
 
   // Hyperliquid and Robinhood Chain are genuinely separate pools of money, so
   // unlike perp-vs-spot within Hyperliquid these DO add up.
-  const rhValue = rh?.active ? rh.total : 0;
+  const rhActive = rh?.active ? rh : null;
+  const rhValue = rhActive ? rhActive.total : 0;
   const equity = hlEquity + rhValue;
+
+  // Robinhood Chain PnL, converted from ETH at the current rate for display.
+  const rhOk = !!rhActive && rhActive.verified;
+  const rhRealised = rhOk ? (rhActive.realisedEth - rhActive.gasEth) * rhActive.ethUsd : 0;
+  const rhUnrealised = rhOk ? rhActive.unrealisedEth * rhActive.ethUsd : 0;
 
   return {
     ...trader,
     ok: true,
     equity,
     hlEquity,
-    rh: rh?.active ? rh : null,
-    unrealised,
-    realised,
+    rh: rhActive,
+    rhOk,
+    rhRealised,
+    rhUnrealised,
+    unrealised: unrealised + rhUnrealised,
+    realised: realised + rhRealised,
     feesPaid,
     positions,
     venues,
     fills: fillRows,
     periods,
-    // PnL is only sourced for the Hyperliquid side; flag when equity exceeds
-    // what that PnL actually covers so the leaderboard can say so.
-    pnlCoversAll: rhValue === 0,
+    // True when every dollar of equity is covered by a PnL source.
+    pnlCoversAll: rhValue === 0 || rhOk,
     // "never traded anywhere" — distinct from "traded and went flat"
-    isEmpty: equity === 0 && positions.length === 0 && fillRows.length === 0,
+    isEmpty: equity === 0 && positions.length === 0 && fillRows.length === 0
+             && !rhActive,
     dexesScanned: dexes,
   };
 }
@@ -592,13 +814,61 @@ function render() {
 
 const periodOf = (t) => t.periods?.[state.period] ?? { pnl: 0, volume: 0, pnlHist: [], avHist: [], startEquity: 0 };
 
+/** Start of the selected range, in epoch ms. 0 for all-time. */
+function periodCutoff() {
+  const DAY = 86_400_000;
+  const now = Date.now();
+  switch (state.period) {
+    case "day": return now - DAY;
+    case "week": return now - 7 * DAY;
+    case "month": return now - 30 * DAY;
+    default: return 0;
+  }
+}
+
+/**
+ * Robinhood Chain PnL in USD for the selected range.
+ * Realised is scoped to the window; unrealised is a property of what is held
+ * right now, so it is range-independent — same convention as the Hyperliquid side.
+ */
+function rhPnl(t) {
+  if (!t.rhOk || !t.rh) return { realised: 0, unrealised: 0, total: 0, gas: 0, volume: 0 };
+  const cut = periodCutoff();
+  const sum = (evts) => evts.reduce((s, e) => s + (e.ts >= cut ? e.eth : 0), 0);
+  const rate = t.rh.ethUsd;
+  const gasEth = sum(t.rh.gasEvents);
+  const realised = (sum(t.rh.realisedEvents) - gasEth) * rate;
+  const unrealised = t.rh.unrealisedEth * rate;
+  return {
+    realised, unrealised, total: realised + unrealised,
+    gas: gasEth * rate,
+    volume: sum(t.rh.volumeEvents) * rate,
+  };
+}
+
+/** Combined PnL across both venues for the selected range. */
+const totalPnlOf = (t) => periodOf(t).pnl + rhPnl(t).total;
+
+/** Combined traded notional across both venues for the selected range. */
+const volumeOf = (t) => periodOf(t).volume + rhPnl(t).volume;
+
+/**
+ * Return on capital, as a percentage.
+ *
+ * The denominator is the tricky part. Hyperliquid reports starting equity, so
+ * that side is easy. On Robinhood Chain there is no deposit record, and
+ * inferring the stake as "equity minus PnL" is badly wrong — it ignores
+ * deposits and produced a nonsense +1481% for a wallet that had simply been
+ * topped up. Capital actually deployed into buys is the honest denominator.
+ */
 function roiOf(t) {
+  const pnl = totalPnlOf(t);
   const p = periodOf(t);
-  const base = p.startEquity > 0 ? p.startEquity : null;
-  if (base) return (p.pnl / base) * 100;
-  // Account funded mid-window: fall back to current equity less the gain.
-  const implied = t.equity - p.pnl;
-  return implied > 0 ? (p.pnl / implied) * 100 : 0;
+  let base = 0;
+  if (p.startEquity > 0) base += p.startEquity;
+  else if (!t.rh) base += Math.max(0, t.equity - pnl);
+  if (t.rhOk && t.rh) base += t.rh.deployedEth * t.rh.ethUsd;
+  return base > 0 ? (pnl / base) * 100 : 0;
 }
 
 /* --------------------------------------------------------- group summary -- */
@@ -607,14 +877,14 @@ function renderGroupTiles() {
   const active = rows.filter((t) => t.ok && !t.isEmpty);
 
   const equity = active.reduce((s, t) => s + t.equity, 0);
-  const pnl = active.reduce((s, t) => s + periodOf(t).pnl, 0);
-  const volume = active.reduce((s, t) => s + periodOf(t).volume, 0);
-  const openPos = active.reduce((s, t) => s + t.positions.length, 0);
+  const volume = active.reduce((s, t) => s + volumeOf(t), 0);
+  const openPos = active.reduce((s, t) => s + t.positions.length + (t.rh?.tokens.length ?? 0), 0);
 
-  // Only traders with a real PnL figure can be "best" or "worst".
-  const withPnl = active.filter((t) => t.pnlCoversAll || t.hlEquity > 0 || t.fills.length);
-  const rhOnly = active.filter((t) => !(t.pnlCoversAll || t.hlEquity > 0 || t.fills.length));
-  const ranked = [...withPnl].sort((a, b) => periodOf(b).pnl - periodOf(a).pnl);
+  // Only traders with a trustworthy PnL figure count toward the group total.
+  const withPnl = active.filter((t) => t.pnlCoversAll);
+  const rhOnly = active.filter((t) => !t.pnlCoversAll);
+  const pnl = withPnl.reduce((s, t) => s + totalPnlOf(t), 0);
+  const ranked = [...withPnl].sort((a, b) => totalPnlOf(b) - totalPnlOf(a));
   const best = ranked[0];
   const worst = ranked.length > 1 ? ranked[ranked.length - 1] : null;
 
@@ -624,14 +894,14 @@ function renderGroupTiles() {
       `${active.length} of ${TRADERS.length} funded`),
     tile(`Group PnL · ${PERIOD_LABEL[state.period]}`, delta(pnl),
       rhOnly.length
-        ? `Hyperliquid only — excludes ${rhOnly.map((t) => t.name).join(", ")}`
-        : `${openPos} open position${openPos === 1 ? "" : "s"}`),
+        ? `excludes ${rhOnly.map((t) => t.name).join(", ")} — PnL unverified`
+        : `across ${withPnl.length} trader${withPnl.length === 1 ? "" : "s"}, both venues`),
     tile("Top performer",
       best ? el("span", { text: best.name }) : el("span", { class: "hint", text: "—" }),
-      best ? `${signedUsd(periodOf(best).pnl)} · ${pct(roiOf(best))}` : "no activity yet"),
+      best ? `${signedUsd(totalPnlOf(best))} · ${pct(roiOf(best))}` : "no activity yet"),
     tile("Laggard",
       worst ? el("span", { text: worst.name }) : el("span", { class: "hint", text: "—" }),
-      worst ? `${signedUsd(periodOf(worst).pnl)} · ${pct(roiOf(worst))}` : "—"),
+      worst ? `${signedUsd(totalPnlOf(worst))} · ${pct(roiOf(worst))}` : "—"),
     tile(`Volume · ${PERIOD_LABEL[state.period]}`, el("span", { text: compactUsd(volume) }), "notional traded"),
   );
 }
@@ -639,11 +909,11 @@ function renderGroupTiles() {
 /* ------------------------------------------------------------ leaderboard -- */
 const SORTERS = {
   equity: (t) => t.equity,
-  pnl:    (t) => periodOf(t).pnl,
+  pnl:    (t) => totalPnlOf(t),
   roi:    (t) => roiOf(t),
   unreal: (t) => t.unrealised,
   real:   (t) => t.realised,
-  vol:    (t) => periodOf(t).volume,
+  vol:    (t) => volumeOf(t),
 };
 
 function renderBoard() {
@@ -660,7 +930,7 @@ function renderBoard() {
   // A missing PnL is not a zero and must not rank as one.
   const funded = loaded.filter((t) => t.ok && !t.isEmpty);
   const rest = loaded.filter((t) => !(t.ok && !t.isEmpty));
-  const hasPnl = (t) => t.pnlCoversAll || t.hlEquity > 0 || t.fills.length > 0;
+  const hasPnl = (t) => t.pnlCoversAll;
   const ranked = funded.filter(hasPnl);
   const unranked = funded.filter((t) => !hasPnl(t));
   ranked.sort((a, b) => (dir === "asc" ? get(a) - get(b) : get(b) - get(a)));
@@ -745,30 +1015,35 @@ function boardRow(t, index) {
     return tr;
   }
 
-  // A trader holding only Robinhood Chain tokens has real equity but no PnL
-  // source, so show "—" rather than a misleading 0.
-  const noPnl = !t.pnlCoversAll && t.hlEquity === 0 && !t.fills.length;
-  const naCell = () => el("td", { class: "num" }, [
-    el("span", { class: "hint", attrs: { title: "No PnL source for Robinhood Chain holdings" }, text: "—" }),
+  // PnL is only withheld when equity exists that no source can account for —
+  // e.g. Robinhood Chain holdings whose swap history failed verification.
+  const noPnl = !t.pnlCoversAll;
+  const naCell = (title) => el("td", { class: "num" }, [
+    el("span", { class: "hint", attrs: { title }, text: "—" }),
   ]);
+  const why = "Swap history could not be reconciled against the wallet balance, so PnL is withheld";
+
+  const pnl = totalPnlOf(t);
 
   tr.append(el("td", { class: "num", text: usd(t.equity) }));
 
   if (noPnl) {
-    tr.append(naCell(), naCell(), naCell(), naCell());
+    tr.append(naCell(why), naCell(why), naCell(why), naCell(why));
   } else {
     tr.append(
-      el("td", { class: "num" }, [delta(p.pnl)]),
-      el("td", { class: "num" }, [el("span", { class: `delta ${dirClass(p.pnl)}`, text: pct(roiOf(t)) })]),
+      el("td", { class: "num" }, [delta(pnl)]),
+      el("td", { class: "num" }, [el("span", { class: `delta ${dirClass(pnl)}`, text: pct(roiOf(t)) })]),
       el("td", { class: "num" }, [delta(t.unrealised)]),
       el("td", { class: "num" }, [delta(t.realised)]),
     );
   }
 
   tr.append(
-    el("td", { class: "num", text: compactUsd(p.volume) }),
+    el("td", { class: "num", text: compactUsd(volumeOf(t)) }),
     el("td", { class: "num", text: String(t.positions.length + (t.rh?.tokens.length ?? 0)) }),
-    el("td", { class: "col-spark" }, [noPnl ? el("span", { class: "hint", text: "—" }) : sparkline(p.pnlHist)]),
+    el("td", { class: "col-spark" }, [
+      p.pnlHist.length > 1 ? sparkline(p.pnlHist) : el("span", { class: "hint", text: "—" }),
+    ]),
   );
 
   if (venueTags.length) tr.querySelector(".trader-cell > div").append(
@@ -880,30 +1155,33 @@ function renderTrader() {
       ? "idle collateral — no open position"
       : "not funded";
 
-  // No Hyperliquid footprint at all -> the PnL tiles have no source. Showing
-  // "$0.00" would read as "flat", which is a different claim from "unknown".
-  const hasHl = t.hlEquity > 0 || t.fills.length > 0 || t.positions.length > 0;
   const naTile = (label, sub) => tile(label, el("span", { class: "hint", text: "—" }), sub);
+  const rp = rhPnl(t);
+  const pnl = totalPnlOf(t);
+  const bothVenues = t.rh && (t.hlEquity > 0 || t.fills.length);
+  const openCount = t.positions.length + (t.rh?.tokens.length ?? 0);
+  const feeNote = t.rh
+    ? `net of ${usd(t.feesPaid + rp.gas)} fees & gas`
+    : `net of ${usd(t.feesPaid)} fees`;
 
   $("#t-tiles").replaceChildren(
     tile("Equity", el("span", { text: usd(t.equity) }), equitySub),
-    hasHl
-      ? tile(`PnL · ${PERIOD_LABEL[state.period]}`, delta(p.pnl), pct(roiOf(t)) + " on starting equity")
-      : naTile(`PnL · ${PERIOD_LABEL[state.period]}`, "no PnL source for this venue"),
-    hasHl
+    t.pnlCoversAll
+      ? tile(`PnL · ${PERIOD_LABEL[state.period]}`, delta(pnl),
+          bothVenues ? `${pct(roiOf(t))} · both venues combined` : pct(roiOf(t)) + " on starting equity")
+      : naTile(`PnL · ${PERIOD_LABEL[state.period]}`, "swap history unverified"),
+    t.pnlCoversAll
       ? tile("Unrealised", delta(t.unrealised),
-          `${t.positions.length} open position${t.positions.length === 1 ? "" : "s"}`)
-      : naTile("Unrealised", "needs cross-pool swap history"),
-    hasHl
-      ? tile("Realised", delta(t.realised), `net of ${usd(t.feesPaid)} fees`)
-      : naTile("Realised", "needs cross-pool swap history"),
-    hasHl
-      ? tile("Realised + unrealised", delta(totalPnl), "lifetime, from fills")
+          `${openCount} open position${openCount === 1 ? "" : "s"}`)
+      : naTile("Unrealised", "swap history unverified"),
+    t.pnlCoversAll
+      ? tile("Realised", delta(t.realised), feeNote)
+      : naTile("Realised", "swap history unverified"),
+    t.pnlCoversAll
+      ? tile("Realised + unrealised", delta(t.realised + t.unrealised), "lifetime")
       : naTile("Realised + unrealised", "—"),
-    hasHl
-      ? tile(`Volume · ${PERIOD_LABEL[state.period]}`, el("span", { text: compactUsd(p.volume) }),
-          `${t.fills.length} fill${t.fills.length === 1 ? "" : "s"}`)
-      : tile("Holdings", el("span", { text: String(t.rh?.tokens.length ?? 0) }), "tokens on " + RH.short),
+    tile(`Volume · ${PERIOD_LABEL[state.period]}`, el("span", { text: compactUsd(volumeOf(t)) }),
+      t.rh ? `${t.rh.txCount} on-chain tx · ${t.fills.length} fills` : `${t.fills.length} fill${t.fills.length === 1 ? "" : "s"}`),
   );
 
   renderChart(t);
@@ -920,13 +1198,17 @@ function renderRobinhood(t) {
   if (!rh) { panel.hidden = true; return; }
   panel.hidden = false;
 
-  $("#rh-count").textContent =
-    `${usd(rh.total)} total · ${rh.tokens.length} token${rh.tokens.length === 1 ? "" : "s"}`;
+  const rp = rhPnl(t);
+  $("#rh-count").textContent = t.rhOk
+    ? `${usd(rh.total)} · ${signedUsd(rp.total)} PnL`
+    : `${usd(rh.total)} · PnL unverified`;
+
+  const eth = (v, dp = 4) => `${v >= 0 ? "" : "−"}${Math.abs(v).toFixed(dp)} Ξ`;
 
   const tbl = el("table", { class: "grid" });
-  const head = ["Asset", "Quantity", "Price", "Value", "Share", "Price source"];
+  const head = ["Asset", "Quantity", "Price", "Value", "Cost", "Unrealised", "Realised", "Source"];
   tbl.append(el("thead", {}, [el("tr", {}, head.map((h, i) =>
-    el("th", { class: i >= 1 && i <= 4 ? "num" : "", attrs: { scope: "col" }, text: h })))]));
+    el("th", { class: i >= 1 && i <= 6 ? "num" : "", attrs: { scope: "col" }, text: h })))]));
 
   const body = [];
 
@@ -937,22 +1219,31 @@ function renderRobinhood(t) {
       el("td", { class: "num", text: rh.nativeQty.toLocaleString(undefined, { maximumFractionDigits: 6 }) }),
       el("td", { class: "num", text: usd(rh.ethUsd) }),
       el("td", { class: "num", text: usd(rh.nativeUsd) }),
-      el("td", { class: "num", text: rh.total > 0 ? pctPlain(rh.nativeUsd / rh.total * 100) : "—" }),
+      el("td", { class: "num", text: "—" }),
+      el("td", { class: "num", text: "—" }),
+      el("td", { class: "num", text: "—" }),
       el("td", {}, [el("span", { class: "hint", text: "explorer" })]),
     ]));
   }
 
   for (const tok of rh.tokens) {
     const priced = tok.value != null;
+    const costUsd = tok.costEth != null ? tok.costEth * rh.ethUsd : null;
+    const unrealUsd = tok.unrealisedEth != null ? tok.unrealisedEth * rh.ethUsd : null;
+    const realUsd = tok.realisedEth != null ? tok.realisedEth * rh.ethUsd : null;
+
     body.push(el("tr", { class: priced && tok.value < RH.dustUsd ? "is-dust" : "" }, [
       el("td", {}, [
         el("strong", { text: tok.symbol }),
         tok.name && tok.name !== tok.symbol ? el("span", { class: "sub-name", text: tok.name }) : null,
+        tok.uncosted ? el("span", { class: "tag", attrs: { title: "Arrived as a transfer — cost basis unknown" }, text: "airdrop" }) : null,
       ]),
       el("td", { class: "num", text: tok.qty.toLocaleString(undefined, { maximumFractionDigits: 4 }) }),
       el("td", { class: "num", text: priced ? "$" + tok.priceUsd.toPrecision(4) : "—" }),
       el("td", { class: "num", text: priced ? usd(tok.value) : "—" }),
-      el("td", { class: "num", text: priced && rh.total > 0 ? pctPlain(tok.value / rh.total * 100) : "—" }),
+      el("td", { class: "num", text: costUsd != null ? usd(costUsd) : "—" }),
+      el("td", { class: "num" }, [unrealUsd != null ? delta(unrealUsd) : el("span", { class: "hint", text: "—" })]),
+      el("td", { class: "num" }, [realUsd ? delta(realUsd) : el("span", { class: "hint", text: "—" })]),
       el("td", {}, [el("span", {
         class: "hint",
         text: tok.source === "pool" ? "DEX pool" : tok.source === "blockscout" ? "explorer" : "no price",
@@ -960,13 +1251,41 @@ function renderRobinhood(t) {
     ]));
   }
 
+  // fully-exited positions carry realised PnL but hold no balance
+  for (const c of rh.closed) {
+    if (Math.abs(c.realisedEth) < 1e-9) continue;
+    body.push(el("tr", { class: "is-closed" }, [
+      el("td", {}, [
+        el("strong", { text: c.symbol }),
+        el("span", { class: "tag", text: "closed" }),
+      ]),
+      el("td", { class: "num", text: "0" }),
+      el("td", { class: "num", text: "—" }),
+      el("td", { class: "num", text: "—" }),
+      el("td", { class: "num", text: "—" }),
+      el("td", { class: "num", text: "—" }),
+      el("td", { class: "num" }, [delta(c.realisedEth * rh.ethUsd)]),
+      el("td", {}, [el("span", { class: "hint", text: `${c.buys}B / ${c.sells}S` })]),
+    ]));
+  }
+
   tbl.append(el("tbody", {}, body));
   $("#rh-holdings").replaceChildren(tbl);
 
   const bits = [
-    "Prices are read from each token's on-chain DEX pool — V3 spot price or V2 reserves — or from the explorer where it has one.",
-    "Profit and loss is not shown for this venue: it needs full cross-pool swap history, which no browser-reachable source provides — a wrong figure would be worse than none.",
+    `Swaps are rebuilt from on-chain history (${rh.txCount} transactions) and priced against each token's DEX pool.`,
+    `PnL is accounted in ETH — the quote asset of every pool here — and shown in dollars at the current rate (${usd(rh.ethUsd)}/ETH).`,
+    `Realised ${eth(rp.total > 0 || rp.realised ? rh.realisedEth : 0)} gross, less ${eth(rh.gasEth)} gas.`,
   ];
+  if (rh.verified) {
+    bits.push("Every holding reconciles against the reconstructed history, so the cost basis is sound.");
+  } else {
+    bits.push("The reconstruction does not reproduce every balance, so PnL is withheld rather than shown wrong.");
+  }
+  if (rh.uncostedProceedsEth > 0) {
+    bits.push(`${eth(rh.uncostedProceedsEth)} of proceeds came from tokens that arrived as transfers — ` +
+              `their cost is unknown, not zero, so they are excluded from realised PnL.`);
+  }
   if (rh.unpriced) bits.push(`${rh.unpriced} token${rh.unpriced === 1 ? "" : "s"} had no pool and could not be valued.`);
   $("#rh-note").textContent = bits.join(" ");
 }
@@ -1219,12 +1538,22 @@ function renderPositions(t) {
 function renderFills(t) {
   const box = $("#fills");
   const fills = t.fills ?? [];
-  $("#fill-count").textContent = fills.length
-    ? `${fills.length} fill${fills.length === 1 ? "" : "s"} · ${signedUsd(t.realised)} realised`
+  const swaps = t.rh?.trades ?? [];
+
+  $("#fill-count").textContent = (fills.length || swaps.length)
+    ? `${fills.length + swaps.length} trade${fills.length + swaps.length === 1 ? "" : "s"}` +
+      ` · ${signedUsd(t.realised)} realised`
     : "";
 
+  // Robinhood Chain swaps: a token/ETH swap, not a perp fill, so it gets its
+  // own table rather than being forced into the perp columns.
+  if (swaps.length) renderSwapTable(t, swaps);
+  else $("#swaps-panel").hidden = true;
+
   if (!fills.length) {
-    box.replaceChildren(el("div", { class: "empty", text: "No trades yet." }));
+    box.replaceChildren(el("div", { class: "empty",
+      text: swaps.length ? "No Hyperliquid fills — see Robinhood Chain swaps above."
+                         : "No trades yet." }));
     return;
   }
 
@@ -1258,6 +1587,38 @@ function renderFills(t) {
   })));
 
   box.replaceChildren(tbl);
+}
+
+/** Robinhood Chain swap history, reconstructed from on-chain transfers. */
+function renderSwapTable(t, swaps) {
+  const panel = $("#swaps-panel");
+  panel.hidden = false;
+  const rate = t.rh.ethUsd;
+
+  $("#swaps-count").textContent =
+    `${swaps.length} swap${swaps.length === 1 ? "" : "s"} · newest first`;
+
+  const head = ["Time", "Token", "Side", "Quantity", "ETH", "Value", "Realised"];
+  const tbl = el("table", { class: "grid" });
+  tbl.append(el("thead", {}, [el("tr", {}, head.map((h, i) =>
+    el("th", { class: i >= 3 ? "num" : "", attrs: { scope: "col" }, text: h })))]));
+
+  tbl.append(el("tbody", {}, swaps.slice(0, 250).map((s) => {
+    const isBuy = s.side === "Buy" || s.side === "Received";
+    return el("tr", {}, [
+      el("td", { text: s.ts ? fmtTime(s.ts) : "—" }),
+      el("td", {}, [el("strong", { text: s.symbol })]),
+      el("td", {}, [el("span", { class: isBuy ? "side-long" : "side-short", text: s.side })]),
+      el("td", { class: "num", text: s.qty.toLocaleString(undefined, { maximumFractionDigits: 4 }) }),
+      el("td", { class: "num", text: s.eth ? s.eth.toFixed(6) : "—" }),
+      el("td", { class: "num", text: s.eth ? usd(s.eth * rate) : "—" }),
+      el("td", { class: "num" }, [
+        s.pnlEth != null ? delta(s.pnlEth * rate) : el("span", { class: "hint", text: "—" }),
+      ]),
+    ]);
+  })));
+
+  $("#swaps").replaceChildren(tbl);
 }
 
 /* =============================== ROUTING ================================= */

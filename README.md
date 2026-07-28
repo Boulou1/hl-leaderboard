@@ -90,18 +90,43 @@ Pools are found by taking the token's top holders from the explorer, keeping the
 contracts (the burn address is often holder #1), and confirming each candidate's
 `token0()`/`token1()` pair against WETH.
 
-### No PnL for this venue — on purpose
+### PnL, rebuilt from on-chain history
 
-The dashboard shows Robinhood Chain **value**, and `—` for PnL. Realised PnL needs
-complete swap history, and BasedBot's trades endpoint is **pool-scoped**, so its
-history is partial by construction: Axel's SBS returns 27 sells against 1 buy — he
-appears to have sold 20.9M more than he bought, which produced a plausible-looking
-but entirely wrong "−$1,551 realised" in an early draft.
+Every swap is reconstructed by joining, per transaction hash:
 
-Full history *is* reconstructable from Blockscout (`/addresses/{a}/token-transfers`
-joined with native value and internal transactions, per tx hash) and that is the
-correct way to add real PnL here. Until that exists, no number is shown rather
-than a wrong one.
+| Source | Gives |
+|---|---|
+| `/addresses/{a}/token-transfers` | which token moved, and which way |
+| `/addresses/{a}/transactions` | native ETH spent (a buy) and gas |
+| `/addresses/{a}/internal-transactions` | native ETH received (a sell) |
+
+A buy is a transaction where ETH leaves in the transaction's `value` and tokens
+arrive; a sell is the reverse, with proceeds paid back as an internal transaction
+from the router. Cost basis is weighted-average per token, realised PnL is booked
+on each sell, and both are scoped by the range selector via per-event timestamps.
+
+**Accounting is in ETH**, the quote asset of every pool here, and converted at the
+current rate only for display. Blockscout returns `historic_exchange_rate: null`,
+so there is no trustworthy per-trade USD rate — ETH-denominated PnL is exact and
+needs no price history.
+
+Three guards, each protecting against a wrong number that looked right:
+
+1. **Reconstruction is verified against reality.** The quantity implied by the
+   swaps must match the wallet's actual token balance. If it doesn't, PnL is
+   withheld and shown as `—`. This is the test BasedBot's pool-scoped feed fails:
+   it reports 27 SBS sells against 1 buy — 20.9M more sold than ever bought — which
+   yielded a completely credible-looking **−$1,551 realised** in an early draft.
+   Reading the chain directly finds **2** buys, quantities balance to zero, and the
+   real figure is a **profit**.
+2. **Airdrops have unknown cost, not zero cost.** Tokens that arrive as plain
+   transfers are tagged and their proceeds excluded from realised PnL. Booking them
+   as free manufactured a fake "+$246 profit" for a wallet that had simply been sent
+   spam tokens.
+3. **Return uses capital deployed, not equity minus PnL.** There is no deposit
+   record on-chain, so inferring the stake from current equity ignores top-ups — it
+   produced a nonsense **+1481%**. Gross ETH ever spent on buys is the honest
+   denominator (+35% for the same wallet).
 
 ## Accessibility
 

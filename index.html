@@ -12,7 +12,7 @@
 <!-- Bump ?v=N on both assets every deploy: GitHub Pages serves them with
      cache-control max-age=600, so without this a browser runs stale code for
      up to 10 minutes after a push. -->
-<link rel="stylesheet" href="styles.css?v=3">
+<link rel="stylesheet" href="styles.css?v=6">
 </head>
 <body>
 
@@ -89,10 +89,13 @@
       collateral backing those positions, so it is never added on top, and PnL there is
       net of deposits and withdrawals.
       On <strong>Robinhood Chain</strong> it is the wallet&rsquo;s ETH plus tokens, priced from each
-      token&rsquo;s on-chain DEX pool.
-      PnL is shown as &ldquo;&mdash;&rdquo; for Robinhood Chain holdings: deriving it needs full
-      cross-pool swap history, which no browser-reachable source provides, and a wrong
-      number would be worse than none.
+      token&rsquo;s on-chain DEX pool, and PnL is rebuilt from the wallet&rsquo;s full swap history
+      &mdash; accounted in ETH, the quote asset of every pool here, and converted at the
+      current rate.
+      That reconstruction is checked against the wallet&rsquo;s real balances; if it cannot
+      reproduce them the PnL is withheld and shown as &ldquo;&mdash;&rdquo; rather than
+      guessed at. Tokens that arrived as transfers have an unknown cost, not a zero one,
+      so their proceeds are excluded instead of booked as pure profit.
     </p>
   </section>
 
@@ -134,6 +137,14 @@
       <p class="panel-note" id="rh-note"></p>
     </div>
 
+    <div class="panel" id="swaps-panel" hidden>
+      <div class="panel-head">
+        <h3>Robinhood Chain swaps</h3>
+        <span class="hint" id="swaps-count"></span>
+      </div>
+      <div class="table-scroll" id="swaps"></div>
+    </div>
+
     <div class="panel">
       <div class="panel-head"><h3>Open positions</h3><span class="hint" id="pos-count"></span></div>
       <div class="table-scroll" id="positions"></div>
@@ -152,6 +163,6 @@
   <span id="updated"></span>
 </footer>
 
-<script type="module" src="app.js?v=3"></script>
+<script type="module" src="app.js?v=6"></script>
 </body>
 </html>
