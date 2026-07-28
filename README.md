@@ -22,13 +22,14 @@ python3 -m http.server 4173 --directory .
 
 Then open <http://localhost:4173>.
 
-## Adding or removing a trader
+## Adding or removing a trader / wallet
 
-Edit the `TRADERS` array at the top of [`app.js`](app.js):
+Edit the `TRADERS` array at the top of [`app.js`](app.js). One person can run
+several wallets; everything (equity, PnL, holdings, swaps) is aggregated:
 
 ```js
 const TRADERS = [
-  { name: "Alberic", address: "0x3df4…" },
+  { name: "Sacha", addresses: ["0x4618…", "0x2fa7…"] },
 ];
 ```
 
@@ -105,10 +106,14 @@ arrive; a sell is the reverse, with proceeds paid back as an internal transactio
 from the router. Cost basis is weighted-average per token, realised PnL is booked
 on each sell, and both are scoped by the range selector via per-event timestamps.
 
-**Accounting is in ETH**, the quote asset of every pool here, and converted at the
-current rate only for display. Blockscout returns `historic_exchange_rate: null`,
-so there is no trustworthy per-trade USD rate — ETH-denominated PnL is exact and
-needs no price history.
+**Two cash assets exist on this chain**: native ETH and the real Global Dollar
+(USDG, Paxos, 6 decimals — beware airdrop spam re-using the same symbol with 18
+decimals; only the real contract is treated as money). Some wallets trade
+ETH-quoted, others USDG-quoted; both are handled, and token pools paired against
+either quote are priced. USDG legs are booked at their exact dollar value; ETH
+legs use the current rate (Blockscout returns `historic_exchange_rate: null`, and
+every trade here is days old, so the drift is small and disclosed). ETH↔USDG
+conversions are cash-to-cash: no PnL is booked on them.
 
 Three guards, each protecting against a wrong number that looked right:
 
@@ -125,8 +130,19 @@ Three guards, each protecting against a wrong number that looked right:
    spam tokens.
 3. **Return uses capital deployed, not equity minus PnL.** There is no deposit
    record on-chain, so inferring the stake from current equity ignores top-ups — it
-   produced a nonsense **+1481%**. Gross ETH ever spent on buys is the honest
+   produced a nonsense **+1481%**. Gross cash ever spent on buys is the honest
    denominator (+35% for the same wallet).
+4. **A failed page fails the whole listing.** Blockscout paginates, and silently
+   accepting a truncated list once flipped that same +$1,429 to **−$80**: the sells
+   whose proceeds lived on the missing page booked cost with no proceeds. Partial
+   history now throws, the refresh is dropped, and the previous good data stays on
+   screen — a stale number over a wrong one, every time.
+
+## Base
+
+Some wallets also park ETH on Base (chain 8453). Balance only — no one in this
+group holds tokens or trades there — fetched from a public CORS-open RPC and added
+to equity as cash.
 
 ## Accessibility
 

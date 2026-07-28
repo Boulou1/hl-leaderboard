@@ -45,6 +45,12 @@ const RH = {
   blockscout: "https://robinhoodchain.blockscout.com/api/v2",
   rpc: "https://rpc.mainnet.chain.robinhood.com",
   weth: "0x0bd7d308f8e1639fab988df18a8011f41eacad73",
+  // The REAL Global Dollar (Paxos, 6 decimals, $1) — the second quote asset on
+  // this chain; several wallets trade tokens against USDG rather than ETH.
+  // Beware: airdrop spam re-uses the "USDG" symbol with 18 decimals — only
+  // this contract is money, so only it is treated as a quote/cash asset.
+  usdg: "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+  usdgDecimals: 6,
   // function selectors. Both AMM generations are in use on this chain: V3-style
   // pools answer slot0(), V2-style pairs revert on it and answer getReserves().
   sel: {
@@ -57,18 +63,33 @@ const RH = {
   dustUsd: 0.01,
 };
 
+/* Base (chain 8453) — some wallets park ETH here. Balance only: no one in this
+   group has token holdings or swaps on Base, so there is nothing to price or
+   reconstruct — just real money that belongs in equity. */
+const BASE = {
+  name: "Base",
+  short: "Base",
+  rpc: "https://base-rpc.publicnode.com",
+};
+
+/**
+ * One person can trade from several wallets (Sacha and Nelson each run two),
+ * so a trader is a name plus a LIST of addresses, aggregated everywhere.
+ */
 const TRADERS = [
-  { name: "Alberic", address: "0x3df4eb23d7d13e9624c68d7b9c0ec6bb718f0ad0" },
-  { name: "Axel",    address: "0x96C19c774bD7D35b1D457492002028DCE719946B" },
-  { name: "Nico",    address: "0x5ef3582E18F43eD152522Ca099AC768DeC492733" },
-  { name: "Pierre",  address: "0x9BFc3ebC18C87987D5D3136E27EEB238139920Ef" },
-  { name: "Sacha",   address: "0x4618f6327bda26e10cd338df651e910a9b0aaef1" },
-  { name: "Nelson",  address: "0xea0C29b4FD5DC0F45256f986352c9600b8ec03D1" },
-  { name: "Ronan",   address: "0x6a1fa415f652FFCf75C96800148c9774c8Fd6903" },
+  { name: "Alberic", addresses: ["0x3df4eb23d7d13e9624c68d7b9c0ec6bb718f0ad0"] },
+  { name: "Axel",    addresses: ["0x96C19c774bD7D35b1D457492002028DCE719946B"] },
+  { name: "Nico",    addresses: ["0x5ef3582E18F43eD152522Ca099AC768DeC492733"] },
+  { name: "Pierre",  addresses: ["0x9BFc3ebC18C87987D5D3136E27EEB238139920Ef"] },
+  { name: "Sacha",   addresses: ["0x4618f6327bda26e10cd338df651e910a9b0aaef1",
+                                 "0x2fa77f8b92539b1773c285e5902d0cb539f3247e"] },
+  { name: "Nelson",  addresses: ["0xea0C29b4FD5DC0F45256f986352c9600b8ec03D1",
+                                 "0x61d58fd76df7eb73095de869ef19dc97b2a341af"] },
+  { name: "Ronan",   addresses: ["0x6a1fa415f652FFCf75C96800148c9774c8Fd6903"] },
 ];
 
 const PERIOD_LABEL = { day: "24H", week: "7D", month: "30D", allTime: "All" };
-const REFRESH_MS = 30_000;
+const REFRESH_MS = 60_000;
 const RESCAN_EVERY = 10;   // full multi-dex rescan every Nth refresh
 
 /* ------------------------------------------------------------------ state -- */
@@ -77,8 +98,8 @@ const state = {
   metric: "pnl",
   sort: { key: "pnl", dir: "desc" },
   dexes: null,          // null until perpDexs resolves
-  byAddress: new Map(), // address -> trader record
-  route: { view: "board", address: null },
+  byName: new Map(),    // trader name -> aggregated record
+  route: { view: "board", name: null },
   refreshCount: 0,
   timer: null,
 };
@@ -125,17 +146,18 @@ async function loadDexes() {
 /* ------------------------------------------------- Robinhood Chain source -- */
 const bsGate = makeGate(4);
 
-async function bsGet(path, retries = 2) {
+async function bsGet(path, retries = 4) {
   return bsGate(async () => {
     for (let attempt = 0; ; attempt++) {
       try {
         const res = await fetch(RH.blockscout + path);
         if (res.ok) return await res.json();
-        if (res.status !== 429 || attempt >= retries) throw new Error(`blockscout ${res.status}`);
+        const retryable = res.status === 429 || res.status >= 500;
+        if (!retryable || attempt >= retries) throw new Error(`blockscout ${res.status}`);
       } catch (err) {
         if (attempt >= retries) throw err;
       }
-      await sleep(400 * (attempt + 1));
+      await sleep(700 * (attempt + 1));
     }
   });
 }
@@ -180,15 +202,16 @@ async function ethCall(to, data, retries = 2) {
 }
 
 /** Tokens repeat across wallets, so pool lookups and prices are cached. */
-const rhPoolCache = new Map();   // token -> {pool, tokenIsToken0} | null
-const rhPriceCache = new Map();  // token -> price in WETH
+const rhPoolCache = new Map();   // token -> {pool, tokenIsToken0, quote} | null
+const rhPriceCache = new Map();  // token -> price in USD (needs ethUsd at call time)
 
 const addrFromWord = (word) => "0x" + word.slice(-40).toLowerCase();
 
 /**
- * Find a token's WETH pool. The pool holds most of the float, so it is near the
- * top of the holder list -- but so is the burn address, hence the contract
- * filter, and each candidate is confirmed by its token0/token1 pair.
+ * Find a token's pool against either quote asset (WETH or USDG). The pool holds
+ * most of the float, so it is near the top of the holder list -- but so is the
+ * burn address, hence the contract filter, and each candidate is confirmed by
+ * its token0/token1 pair.
  */
 async function rhFindPool(token) {
   const key = token.toLowerCase();
@@ -208,11 +231,14 @@ async function rhFindPool(token) {
       const [w0, w1] = await Promise.all([ethCall(cand, RH.sel.token0), ethCall(cand, RH.sel.token1)]);
       if (!w0 || !w1) return null;
       const a0 = addrFromWord(w0), a1 = addrFromWord(w1);
-      if (a0 === key && a1 === RH.weth) return { pool: cand, tokenIsToken0: true };
-      if (a1 === key && a0 === RH.weth) return { pool: cand, tokenIsToken0: false };
+      for (const [quote, qa] of [["weth", RH.weth], ["usdg", RH.usdg]]) {
+        if (a0 === key && a1 === qa) return { pool: cand, tokenIsToken0: true, quote };
+        if (a1 === key && a0 === qa) return { pool: cand, tokenIsToken0: false, quote };
+      }
       return null;
     }));
-    found = probes.find(Boolean) ?? null;
+    // Prefer a WETH pool when both exist (deeper on this chain).
+    found = probes.find((p) => p?.quote === "weth") ?? probes.find(Boolean) ?? null;
   } catch { /* leave found null — the token just won't be priced */ }
 
   rhPoolCache.set(key, found);
@@ -220,13 +246,13 @@ async function rhFindPool(token) {
 }
 
 /**
- * Token price denominated in WETH, read straight from its pool.
+ * Token price in USD, read straight from its pool (WETH- or USDG-paired).
  *
  * Tries V3 (sqrtPriceX96) first, then falls back to a V2 pair's reserves —
  * both generations are live on this chain, and assuming V3 silently dropped
  * whole holdings (Axel's SBS is a V2 pair worth a few hundred dollars).
  */
-async function rhTokenPriceWeth(token, decimals) {
+async function rhTokenPriceUsd(token, decimals, ethUsd) {
   const key = token.toLowerCase();
   if (rhPriceCache.has(key)) return rhPriceCache.get(key);
 
@@ -234,6 +260,7 @@ async function rhTokenPriceWeth(token, decimals) {
   const found = await rhFindPool(token);
 
   if (found) {
+    const qDec = found.quote === "usdg" ? RH.usdgDecimals : 18;
     // token1-per-token0, in human units, whichever shape the pool is.
     let human = null;
 
@@ -242,8 +269,8 @@ async function rhTokenPriceWeth(token, decimals) {
       const sqrtPriceX96 = Number(BigInt("0x" + slot0.slice(2, 66)));
       if (sqrtPriceX96 > 0) {
         const r = sqrtPriceX96 / 2 ** 96;
-        const d0 = found.tokenIsToken0 ? decimals : 18;
-        const d1 = found.tokenIsToken0 ? 18 : decimals;
+        const d0 = found.tokenIsToken0 ? decimals : qDec;
+        const d1 = found.tokenIsToken0 ? qDec : decimals;
         human = r * r * 10 ** (d0 - d1);
       }
     } else {
@@ -251,15 +278,16 @@ async function rhTokenPriceWeth(token, decimals) {
       if (res && res.length >= 130) {
         const r0 = Number(BigInt("0x" + res.slice(2, 66)));
         const r1 = Number(BigInt("0x" + res.slice(66, 130)));
-        const d0 = found.tokenIsToken0 ? decimals : 18;
-        const d1 = found.tokenIsToken0 ? 18 : decimals;
+        const d0 = found.tokenIsToken0 ? decimals : qDec;
+        const d1 = found.tokenIsToken0 ? qDec : decimals;
         const h0 = r0 / 10 ** d0, h1 = r1 / 10 ** d1;
         if (h0 > 0 && h1 > 0) human = h1 / h0;
       }
     }
 
     if (human != null && human > 0 && Number.isFinite(human)) {
-      price = found.tokenIsToken0 ? human : 1 / human;
+      const inQuote = found.tokenIsToken0 ? human : 1 / human;
+      price = found.quote === "usdg" ? inQuote : inQuote * ethUsd;
     }
   }
 
@@ -277,8 +305,10 @@ async function bsPaged(path, maxPages = 12) {
         Object.entries(params).filter(([, v]) => v != null)
           .map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&")
       : "";
-    let d;
-    try { d = await bsGet(path + qs); } catch { break; }
+    // A failed page must fail the whole listing: silently returning a partial
+    // history once flipped a +$1,429 realised PnL to −$80, because sells whose
+    // proceeds lived on the missing page booked cost with no proceeds.
+    const d = await bsGet(path + qs);
     const items = d.items ?? [];
     out.push(...items);
     if (!items.length || !d.next_page_params) break;
@@ -291,24 +321,24 @@ async function bsPaged(path, maxPages = 12) {
  * Rebuild every swap this wallet made on Robinhood Chain from on-chain data,
  * and derive cost basis, realised and unrealised PnL.
  *
- * Accounting is in ETH — the actual quote asset of every pool here. Blockscout
- * returns `historic_exchange_rate: null`, so there is no trustworthy per-trade
- * USD rate; ETH-denominated PnL is exact and is converted at the current rate
- * only for display.
+ * TWO cash assets exist on this chain: native ETH and the real Global Dollar
+ * (USDG). A swap is a transaction where tokens move one way and cash moves the
+ * other — ETH via the transaction's `value` (buys) or an internal transaction
+ * from the router (sells), USDG as an ordinary ERC-20 transfer leg.
  *
- * A swap is a transaction where tokens move one way and native ETH the other:
- * buys carry ETH in the transaction's `value`, sells receive ETH back as an
- * internal transaction from the router.
+ * Accounting is in USD: USDG legs are exact ($1); ETH legs are converted at the
+ * current rate (Blockscout returns `historic_exchange_rate: null`, and every
+ * trade here is days old, so the drift is small and disclosed).
  *
- * Two honesty guards, both learned the hard way:
+ * Honesty guards, each learned the hard way:
  *  - Reconstructed quantity is checked against the wallet's real balance. If it
  *    disagrees the history is incomplete and PnL is withheld. (BasedBot's
  *    pool-scoped feed failed exactly this test: 27 sells against 1 buy.)
  *  - Tokens that arrived as plain transfers (airdrops) have unknown cost, not
- *    zero cost. Counting them as free manufactures profit, so their proceeds
- *    are reported separately and excluded from realised PnL.
+ *    zero cost. Their proceeds are reported separately, not booked as profit.
+ *  - ETH<->USDG conversions are cash-to-cash: no PnL is booked on them.
  */
-async function rhSwaps(address) {
+async function rhSwaps(address, ethUsd) {
   const me = address.toLowerCase();
   const [transfers, txs, internals] = await Promise.all([
     bsPaged(`/addresses/${address}/token-transfers?type=ERC-20`),
@@ -334,8 +364,8 @@ async function rhSwaps(address) {
     ethIn.set(h, (ethIn.get(h) ?? 0) + num(it.value) / 1e18);
   }
 
-  // token movements per transaction
-  const perTx = new Map();   // hash -> { sort, tokens: Map(addr -> qty) }
+  // token movements per transaction; the real-USDG leg is cash, not a position
+  const perTx = new Map();   // hash -> { sort, ts, tokens: Map(addr -> qty), usdg }
   const tokenMeta = new Map();
   for (const x of transfers) {
     const tk = x.token ?? {};
@@ -354,70 +384,77 @@ async function rhSwaps(address) {
         sort: [num(x.block_number), num(x.log_index)],
         ts: Date.parse(x.timestamp) || 0,
         tokens: new Map(),
+        usdg: 0,
       });
     }
     const rec = perTx.get(h);
     const to = (x.to?.hash ?? "").toLowerCase();
     const frm = (x.from?.hash ?? "").toLowerCase();
     const signed = to === me ? amt : frm === me ? -amt : 0;
-    if (signed) rec.tokens.set(ta, (rec.tokens.get(ta) ?? 0) + signed);
+    if (!signed) continue;
+    if (ta === RH.usdg) rec.usdg += signed;
+    else rec.tokens.set(ta, (rec.tokens.get(ta) ?? 0) + signed);
   }
 
   // oldest first, so cost basis accumulates in the right order
   const order = [...perTx.entries()].sort((a, b) =>
     a[1].sort[0] - b[1].sort[0] || a[1].sort[1] - b[1].sort[1]);
 
-  const books = new Map();   // token -> ledger
+  const books = new Map();   // token -> ledger, all cash figures in USD
   const blank = () => ({
-    qty: 0, costEth: 0, realisedEth: 0, buys: 0, sells: 0,
-    uncostedIn: 0, uncostedProceedsEth: 0,
+    qty: 0, costUsd: 0, realisedUsd: 0, buys: 0, sells: 0,
+    uncostedIn: 0, uncostedProceedsUsd: 0,
   });
   // Timestamped so the range selector can scope this venue too.
-  const realisedEvents = [];
-  const volumeEvents = [];   // every swap's ETH notional
+  const realisedEvents = [];   // { ts, usd }
+  const volumeEvents = [];     // { ts, usd } — every swap's cash notional
   const trades = [];
-  let deployedEth = 0;       // gross ETH ever spent buying — the capital at risk
+  let deployedUsd = 0;         // gross cash ever spent buying — capital at risk
 
   for (const [hash, rec] of order) {
-    const inEth = ethIn.get(hash) ?? 0;
-    const outEth = ethOut.get(hash) ?? 0;
+    // Cash legs of this transaction, in USD. USDG is exact; ETH at current rate.
+    const usdgIn = Math.max(0, rec.usdg), usdgOut = Math.max(0, -rec.usdg);
+    const cashIn = (ethIn.get(hash) ?? 0) * ethUsd + usdgIn;
+    const cashOut = (ethOut.get(hash) ?? 0) * ethUsd + usdgOut;
+    const quote = usdgIn + usdgOut > 0 ? "USDG" : "ETH";
+
     for (const [ta, dq] of rec.tokens) {
       if (!books.has(ta)) books.set(ta, blank());
       const b = books.get(ta);
       const sym = tokenMeta.get(ta)?.symbol ?? "?";
 
       if (dq > 0) {
-        if (outEth > 0) {
-          b.qty += dq; b.costEth += outEth; b.buys++;
-          deployedEth += outEth;
-          volumeEvents.push({ ts: rec.ts, eth: outEth });
-          trades.push({ ts: rec.ts, symbol: sym, side: "Buy", qty: dq, eth: outEth, token: ta });
+        if (cashOut > 0) {
+          b.qty += dq; b.costUsd += cashOut; b.buys++;
+          deployedUsd += cashOut;
+          volumeEvents.push({ ts: rec.ts, usd: cashOut });
+          trades.push({ ts: rec.ts, symbol: sym, side: "Buy", qty: dq, cashUsd: cashOut, quote, token: ta });
         } else {
-          b.qty += dq; b.uncostedIn++;               // airdrop / incoming transfer
-          trades.push({ ts: rec.ts, symbol: sym, side: "Received", qty: dq, eth: 0, token: ta });
+          b.qty += dq; b.uncostedIn++;               // airdrop / transfer in
+          trades.push({ ts: rec.ts, symbol: sym, side: "Received", qty: dq, cashUsd: 0, quote: null, token: ta });
         }
       } else if (dq < 0) {
         const amt = -dq;
-        const avg = b.qty > 0 ? b.costEth / b.qty : 0;
-        if (inEth > 0) {
-          volumeEvents.push({ ts: rec.ts, eth: inEth });
+        const avg = b.qty > 0 ? b.costUsd / b.qty : 0;
+        if (cashIn > 0) {
+          volumeEvents.push({ ts: rec.ts, usd: cashIn });
           if (b.uncostedIn > 0) {
-            b.uncostedProceedsEth += inEth;          // cost unknown, not zero
-            trades.push({ ts: rec.ts, symbol: sym, side: "Sell", qty: amt, eth: inEth,
-                          token: ta, pnlEth: null });
+            b.uncostedProceedsUsd += cashIn;         // cost unknown, not zero
+            trades.push({ ts: rec.ts, symbol: sym, side: "Sell", qty: amt, cashUsd: cashIn, quote,
+                          token: ta, pnlUsd: null });
           } else {
-            const r = inEth - avg * amt;
-            b.realisedEth += r; b.sells++;
-            realisedEvents.push({ ts: rec.ts, eth: r });
-            trades.push({ ts: rec.ts, symbol: sym, side: "Sell", qty: amt, eth: inEth,
-                          token: ta, pnlEth: r });
+            const r = cashIn - avg * amt;
+            b.realisedUsd += r; b.sells++;
+            realisedEvents.push({ ts: rec.ts, usd: r });
+            trades.push({ ts: rec.ts, symbol: sym, side: "Sell", qty: amt, cashUsd: cashIn, quote,
+                          token: ta, pnlUsd: r });
           }
         } else {
-          trades.push({ ts: rec.ts, symbol: sym, side: "Sent", qty: amt, eth: 0, token: ta });
+          trades.push({ ts: rec.ts, symbol: sym, side: "Sent", qty: amt, cashUsd: 0, quote: null, token: ta });
         }
         b.qty -= amt;
-        b.costEth -= avg * amt;
-        if (b.qty < 1e-12) { b.qty = 0; b.costEth = 0; }
+        b.costUsd -= avg * amt;
+        if (b.qty < 1e-12) { b.qty = 0; b.costUsd = 0; }
       }
     }
   }
@@ -425,23 +462,24 @@ async function rhSwaps(address) {
   // gas, with timestamps, so it can be scoped the same way
   const gasEvents = txs
     .filter((t) => (t.from?.hash ?? "").toLowerCase() === me)
-    .map((t) => ({ ts: Date.parse(t.timestamp) || 0, eth: num(t.fee?.value) / 1e18 }));
+    .map((t) => ({ ts: Date.parse(t.timestamp) || 0, usd: (num(t.fee?.value) / 1e18) * ethUsd }));
 
   trades.sort((a, b) => b.ts - a.ts);
 
-  return { books, tokenMeta, gasEth, realisedEvents, gasEvents, volumeEvents, trades,
-           deployedEth, txCount: txs.length, transferCount: transfers.length };
+  return { books, tokenMeta, gasUsd: gasEth * ethUsd, realisedEvents, gasEvents, volumeEvents,
+           trades, deployedUsd, txCount: txs.length, transferCount: transfers.length };
 }
 
 /**
  * Holdings, value and PnL for one wallet on Robinhood Chain.
  */
-async function loadRobinhood(address) {
+async function loadRobinhood(address, wallet) {
+  // No catch here: a failed lookup must fail the load (the caller keeps the
+  // previous good record), not quietly render an active wallet as unfunded.
   const [summary, balances] = await Promise.all([
-    bsGet(`/addresses/${address}`).catch(() => null),
-    bsGet(`/addresses/${address}/token-balances`).catch(() => null),
+    bsGet(`/addresses/${address}`),
+    bsGet(`/addresses/${address}/token-balances`),
   ]);
-  if (!summary) return null;
 
   const ethUsd = num(summary.exchange_rate);
   const nativeQty = num(summary.coin_balance) / 1e18;
@@ -450,13 +488,9 @@ async function loadRobinhood(address) {
   const rawList = Array.isArray(balances) ? balances : (balances?.items ?? []);
 
   // Nothing here at all — skip the (expensive) swap reconstruction entirely.
-  if (nativeQty === 0 && rawList.length === 0) {
-    return { ethUsd, nativeQty: 0, nativeUsd: 0, tokens: [], closed: [], tokenValue: 0,
-             total: 0, unpriced: 0, active: false, realisedEth: 0, unrealisedEth: 0,
-             gasEth: 0, uncostedProceedsEth: 0, verified: true, txCount: 0 };
-  }
+  if (nativeQty === 0 && rawList.length === 0) return null;
 
-  const swaps = await rhSwaps(address).catch(() => null);
+  const swaps = await rhSwaps(address, ethUsd);   // throws on incomplete history
 
   // Price every holding concurrently — serially this is a round trip per token
   // per pool candidate, which visibly stalls the whole page.
@@ -468,26 +502,30 @@ async function loadRobinhood(address) {
     const qty = num(b.value) / 10 ** decimals;
     if (qty <= 0) return null;
 
+    // The real Global Dollar is cash, not a position: $1, no cost basis to
+    // reconstruct, and it must not fail verification for lacking a book.
+    const isCash = addr.toLowerCase() === RH.usdg;
+
     // Blockscout prices a few tokens itself; derive the rest from the pool.
-    let usd = num(t.exchange_rate);
-    let source = usd > 0 ? "blockscout" : null;
+    let usd = isCash ? 1 : num(t.exchange_rate);
+    let source = usd > 0 ? (isCash ? "cash" : "blockscout") : null;
     if (!source) {
-      const weth = await rhTokenPriceWeth(addr, decimals);
-      if (weth != null && ethUsd > 0) { usd = weth * ethUsd; source = "pool"; }
+      const poolUsd = await rhTokenPriceUsd(addr, decimals, ethUsd);
+      if (poolUsd != null) { usd = poolUsd; source = "pool"; }
     }
 
     const book = swaps?.books.get(addr.toLowerCase());
     // Does the swap history actually account for what the wallet holds?
-    const verified = book ? Math.abs(book.qty - qty) <= Math.max(1e-6, qty * 0.005) : false;
-    const costEth = book && verified && !book.uncostedIn ? book.costEth : null;
-    const valueEth = source && ethUsd > 0 ? (qty * usd) / ethUsd : null;
+    const verified = isCash || (book ? Math.abs(book.qty - qty) <= Math.max(1e-6, qty * 0.005) : false);
+    const costUsd = book && verified && !book.uncostedIn ? book.costUsd : null;
+    const value = source ? qty * usd : null;
 
     return {
-      symbol: t.symbol || "?", name: t.name || "", address: addr,
-      qty, priceUsd: source ? usd : null, value: source ? qty * usd : null, source,
-      costEth, valueEth,
-      unrealisedEth: costEth != null && valueEth != null ? valueEth - costEth : null,
-      realisedEth: book && !book.uncostedIn ? book.realisedEth : null,
+      symbol: t.symbol || "?", name: t.name || "", address: addr, wallet,
+      qty, priceUsd: source ? usd : null, value, source, isCash,
+      costUsd,
+      unrealisedUsd: costUsd != null && value != null ? value - costUsd : null,
+      realisedUsd: book && !book.uncostedIn ? book.realisedUsd : null,
       uncosted: !!book?.uncostedIn,
       verified,
     };
@@ -502,41 +540,92 @@ async function loadRobinhood(address) {
   // appear in token-balances, yet they carry most of the realised PnL.
   const held = new Set(tokens.map((t) => t.address.toLowerCase()));
   const closed = [];
-  let realisedEth = 0;
-  let uncostedProceedsEth = 0;
+  let realisedUsd = 0;
+  let uncostedProceedsUsd = 0;
 
   for (const [ta, b] of swaps?.books ?? []) {
-    if (b.uncostedIn) { uncostedProceedsEth += b.uncostedProceedsEth; continue; }
-    realisedEth += b.realisedEth;
+    if (b.uncostedIn) { uncostedProceedsUsd += b.uncostedProceedsUsd; continue; }
+    realisedUsd += b.realisedUsd;
     if (!held.has(ta) && b.sells > 0) {
       const meta = swaps.tokenMeta.get(ta) ?? {};
       closed.push({
-        symbol: meta.symbol || "?", name: meta.name || "", address: ta,
-        realisedEth: b.realisedEth, buys: b.buys, sells: b.sells,
+        symbol: meta.symbol || "?", name: meta.name || "", address: ta, wallet,
+        realisedUsd: b.realisedUsd, buys: b.buys, sells: b.sells,
       });
     }
   }
-  closed.sort((a, b) => b.realisedEth - a.realisedEth);
+  closed.sort((a, b) => b.realisedUsd - a.realisedUsd);
 
-  const unrealisedEth = tokens.reduce((s, t) => s + (t.unrealisedEth ?? 0), 0);
-  const gasEth = swaps?.gasEth ?? 0;
+  const unrealisedUsd = tokens.reduce((s, t) => s + (t.unrealisedUsd ?? 0), 0);
 
   return {
     ethUsd, nativeQty, nativeUsd, tokens, closed, tokenValue,
     total: nativeUsd + tokenValue,
     unpriced,
-    // "Used at all?" — distinguishes a real wallet from an untouched address.
-    active: nativeQty > 0 || tokens.length > 0,
-    realisedEth, unrealisedEth, gasEth, uncostedProceedsEth,
+    active: true,
+    realisedUsd, unrealisedUsd,
+    gasUsd: swaps?.gasUsd ?? 0,
+    uncostedProceedsUsd,
     realisedEvents: swaps?.realisedEvents ?? [],
     gasEvents: swaps?.gasEvents ?? [],
     volumeEvents: swaps?.volumeEvents ?? [],
-    trades: swaps?.trades ?? [],
-    deployedEth: swaps?.deployedEth ?? 0,
+    trades: (swaps?.trades ?? []).map((tr) => ({ ...tr, wallet })),
+    deployedUsd: swaps?.deployedUsd ?? 0,
     // PnL is only shown when the reconstruction reproduces every held balance.
     verified: !!swaps && tokens.every((t) => t.verified || t.value == null),
     txCount: swaps?.txCount ?? 0,
   };
+}
+
+/** Merge several wallets' Robinhood results into one per-person view. */
+function mergeRh(parts) {
+  const live = parts.filter(Boolean);
+  if (!live.length) return null;
+  const sum = (k) => live.reduce((s, p) => s + p[k], 0);
+  const cat = (k) => live.flatMap((p) => p[k]);
+  const merged = {
+    ethUsd: live[0].ethUsd,
+    nativeQty: sum("nativeQty"), nativeUsd: sum("nativeUsd"),
+    tokens: cat("tokens").sort((a, b) => (b.value ?? -1) - (a.value ?? -1)),
+    closed: cat("closed").sort((a, b) => b.realisedUsd - a.realisedUsd),
+    tokenValue: sum("tokenValue"), total: sum("total"), unpriced: sum("unpriced"),
+    active: true,
+    realisedUsd: sum("realisedUsd"), unrealisedUsd: sum("unrealisedUsd"),
+    gasUsd: sum("gasUsd"), uncostedProceedsUsd: sum("uncostedProceedsUsd"),
+    realisedEvents: cat("realisedEvents"), gasEvents: cat("gasEvents"),
+    volumeEvents: cat("volumeEvents"),
+    trades: cat("trades").sort((a, b) => b.ts - a.ts),
+    deployedUsd: sum("deployedUsd"),
+    verified: live.every((p) => p.verified),
+    txCount: sum("txCount"),
+    wallets: live.length,
+  };
+  return merged;
+}
+
+/** ETH/USD from the explorer, cached for the page load. */
+let _ethUsdCache = null;
+async function getEthUsd() {
+  if (_ethUsdCache) return _ethUsdCache;
+  try {
+    const stats = await bsGet("/stats");
+    const p = num(stats.coin_price);
+    if (p > 0) { _ethUsdCache = p; return p; }
+  } catch { /* fall through */ }
+  return 0;
+}
+
+/** Native ETH parked on Base — balance only; no one here trades on Base. */
+async function loadBase(address, ethUsd) {
+  try {
+    const res = await fetch(BASE.rpc, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_getBalance", params: [address, "latest"] }),
+    });
+    if (!res.ok) return 0;
+    const j = await res.json();
+    return j.result ? (Number(BigInt(j.result)) / 1e18) * ethUsd : 0;
+  } catch { return 0; }
 }
 
 /* --------------------------------------------------------------- fetching -- */
@@ -544,20 +633,17 @@ async function loadRobinhood(address) {
  * Load one trader. `knownDexes` limits the position scan on light refreshes;
  * pass null to scan every venue.
  */
-async function loadTrader(trader, knownDexes) {
-  const dexes = knownDexes ?? (await loadDexes());
-
-  const [portfolio, fills, rh, ...states] = await Promise.all([
-    info({ type: "portfolio", user: trader.address }),
-    info({ type: "userFills", user: trader.address }),
-    loadRobinhood(trader.address).catch(() => null),
+/** Hyperliquid state for ONE address: positions, fills, per-period PnL. */
+async function loadHlAddress(address, dexes) {
+  const [portfolio, fills, ...states] = await Promise.all([
+    info({ type: "portfolio", user: address }),
+    info({ type: "userFills", user: address }),
     ...dexes.map((dex) =>
-      info(dex ? { type: "clearinghouseState", user: trader.address, dex }
-               : { type: "clearinghouseState", user: trader.address })
+      info(dex ? { type: "clearinghouseState", user: address, dex }
+               : { type: "clearinghouseState", user: address })
         .catch(() => null)),
   ]);
 
-  // ---- positions across every venue -------------------------------------
   const positions = [];
   const venues = [];
   states.forEach((st, i) => {
@@ -569,14 +655,8 @@ async function loadTrader(trader, knownDexes) {
     for (const p of rows) positions.push({ ...p, dex });
   });
 
-  const unrealised = positions.reduce((s, p) => s + num(p.unrealizedPnl), 0);
-
-  // ---- realised, from fills (closedPnl is gross; fees are the cost) ------
   const fillRows = Array.isArray(fills) ? fills : [];
-  const realised = fillRows.reduce((s, f) => s + num(f.closedPnl) - num(f.fee), 0);
-  const feesPaid = fillRows.reduce((s, f) => s + num(f.fee), 0);
 
-  // ---- portfolio: authoritative equity + per-period PnL ------------------
   const pf = Object.fromEntries(Array.isArray(portfolio) ? portfolio : []);
   const periods = {};
   for (const key of ["day", "week", "month", "allTime"]) {
@@ -588,8 +668,6 @@ async function loadTrader(trader, knownDexes) {
       volume: num(p.vlm),
       pnlHist,
       avHist,
-      // Return on the period's starting equity. Only meaningful when the
-      // account actually held something at the start of the window.
       startEquity: avHist.length ? avHist[0][1] : 0,
     };
   }
@@ -598,22 +676,74 @@ async function loadTrader(trader, knownDexes) {
     ? periods.allTime.avHist[periods.allTime.avHist.length - 1][1]
     : venues.reduce((s, v) => s + v.equity, 0);
 
-  // Hyperliquid and Robinhood Chain are genuinely separate pools of money, so
-  // unlike perp-vs-spot within Hyperliquid these DO add up.
-  const rhActive = rh?.active ? rh : null;
-  const rhValue = rhActive ? rhActive.total : 0;
-  const equity = hlEquity + rhValue;
+  return { positions, venues, fills: fillRows, periods, hlEquity };
+}
 
-  // Robinhood Chain PnL, converted from ETH at the current rate for display.
+/**
+ * Load one trader — aggregated across every wallet they run.
+ * `knownDexes` limits the position scan on light refreshes; null scans all.
+ */
+async function loadTrader(trader, knownDexes) {
+  const dexes = knownDexes ?? (await loadDexes());
+  const addrs = trader.addresses;
+
+  const [hlParts, rhParts, ethUsd] = await Promise.all([
+    Promise.all(addrs.map((a) => loadHlAddress(a, dexes))),
+    Promise.all(addrs.map((a) => loadRobinhood(a, shortAddr(a)))),
+    getEthUsd(),
+  ]);
+  const baseUsd = (await Promise.all(addrs.map((a) => loadBase(a, ethUsd))))
+    .reduce((s, v) => s + v, 0);
+
+  // ---- Hyperliquid, merged across wallets --------------------------------
+  const positions = hlParts.flatMap((h) => h.positions);
+  const fillRows = hlParts.flatMap((h) => h.fills).sort((a, b) => b.time - a.time);
+  const hlEquity = hlParts.reduce((s, h) => s + h.hlEquity, 0);
+
+  // venues merged by dex, equity summed
+  const venueMap = new Map();
+  for (const h of hlParts) for (const v of h.venues) {
+    const cur = venueMap.get(v.dex) ?? { dex: v.dex, equity: 0, count: 0 };
+    cur.equity += v.equity; cur.count += v.count;
+    venueMap.set(v.dex, cur);
+  }
+  const venues = [...venueMap.values()];
+
+  // Scalars sum across wallets; the chart series comes from the wallet with
+  // the most Hyperliquid equity (in practice the only active one).
+  const primary = hlParts.reduce((a, b) => (b.hlEquity > a.hlEquity ? b : a), hlParts[0]);
+  const periods = {};
+  for (const key of ["day", "week", "month", "allTime"]) {
+    periods[key] = {
+      pnl: hlParts.reduce((s, h) => s + h.periods[key].pnl, 0),
+      volume: hlParts.reduce((s, h) => s + h.periods[key].volume, 0),
+      startEquity: hlParts.reduce((s, h) => s + h.periods[key].startEquity, 0),
+      pnlHist: primary.periods[key].pnlHist,
+      avHist: primary.periods[key].avHist,
+    };
+  }
+
+  const unrealised = positions.reduce((s, p) => s + num(p.unrealizedPnl), 0);
+  const realised = fillRows.reduce((s, f) => s + num(f.closedPnl) - num(f.fee), 0);
+  const feesPaid = fillRows.reduce((s, f) => s + num(f.fee), 0);
+
+  // ---- other venues -------------------------------------------------------
+  // Hyperliquid, Robinhood Chain and Base are genuinely separate pools of
+  // money, so unlike perp-vs-spot within Hyperliquid these DO add up.
+  const rhActive = mergeRh(rhParts);
+  const rhValue = rhActive ? rhActive.total : 0;
+  const equity = hlEquity + rhValue + baseUsd;
+
   const rhOk = !!rhActive && rhActive.verified;
-  const rhRealised = rhOk ? (rhActive.realisedEth - rhActive.gasEth) * rhActive.ethUsd : 0;
-  const rhUnrealised = rhOk ? rhActive.unrealisedEth * rhActive.ethUsd : 0;
+  const rhRealised = rhOk ? rhActive.realisedUsd - rhActive.gasUsd : 0;
+  const rhUnrealised = rhOk ? rhActive.unrealisedUsd : 0;
 
   return {
     ...trader,
     ok: true,
     equity,
     hlEquity,
+    baseUsd,
     rh: rhActive,
     rhOk,
     rhRealised,
@@ -625,7 +755,8 @@ async function loadTrader(trader, knownDexes) {
     venues,
     fills: fillRows,
     periods,
-    // True when every dollar of equity is covered by a PnL source.
+    // True when every dollar of equity is covered by a PnL source. Idle Base
+    // ETH is cash — it has no PnL to source.
     pnlCoversAll: rhValue === 0 || rhOk,
     // "never traded anywhere" — distinct from "traded and went flat"
     isEmpty: equity === 0 && positions.length === 0 && fillRows.length === 0
@@ -644,27 +775,33 @@ async function loadAll({ full = false } = {}) {
   // Bounded concurrency: fully sequential is slow now that each trader also
   // does Robinhood Chain lookups, but unbounded would trip the Hyperliquid
   // rate limit. Rows still appear as each trader resolves.
-  const CONCURRENCY = 3;
+  const CONCURRENCY = 2;
   const queue = [...TRADERS];
 
   const worker = async () => {
     for (;;) {
       const trader = queue.shift();
       if (!trader) return;
-      const prev = state.byAddress.get(trader.address);
-      const known = full || !prev?.dexesScanned
+      const prev = state.byName.get(trader.name);
+      const known = full || !prev?.ok || !prev?.dexesScanned
         ? null
         : dedupe(["", ...prev.venues.map((v) => v.dex)]);
       try {
-        state.byAddress.set(trader.address, await loadTrader(trader, known));
+        state.byName.set(trader.name, await loadTrader(trader, known));
       } catch (err) {
         failures++;
-        state.byAddress.set(trader.address, {
-          ...trader, ok: false, error: String(err.message || err),
-          equity: 0, hlEquity: 0, rh: null, unrealised: 0, realised: 0,
-          positions: [], venues: [], fills: [], periods: {},
-          isEmpty: false, pnlCoversAll: true,
-        });
+        // A transient failure (usually a 429) must never wipe out good data:
+        // keep the previous record on screen and just mark it stale.
+        if (prev?.ok) {
+          state.byName.set(trader.name, { ...prev, stale: true });
+        } else {
+          state.byName.set(trader.name, {
+            ...trader, ok: false, error: String(err.message || err),
+            equity: 0, hlEquity: 0, baseUsd: 0, rh: null, unrealised: 0, realised: 0,
+            positions: [], venues: [], fills: [], periods: {},
+            isEmpty: false, pnlCoversAll: true,
+          });
+        }
       }
       render();
     }
@@ -673,7 +810,7 @@ async function loadAll({ full = false } = {}) {
   await Promise.all(Array.from({ length: CONCURRENCY }, worker));
 
   document.querySelectorAll(".view").forEach((v) => v.classList.remove("is-stale"));
-  if (failures) setStatus("error", `${failures} of ${TRADERS.length} failed`);
+  if (failures) setStatus("error", `${failures} refresh${failures === 1 ? "" : "es"} failed — retrying`);
   else setStatus("live", "Live");
 
   const stamp = new Date().toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
@@ -717,6 +854,13 @@ const dirClass = (n) => (n > 0 ? "up" : n < 0 ? "down" : "flat");
 
 /** Truncated display form. The full value is deliberately not rendered. */
 const shortAddr = (a) => `${a.slice(0, 6)}…${a.slice(-4)}`;
+
+/** "0x1234…abcd" or "0x1234…abcd +1 wallet" for multi-wallet traders. */
+const walletsLabel = (t) => {
+  const list = t.addresses ?? [];
+  if (!list.length) return "";
+  return shortAddr(list[0]) + (list.length > 1 ? `  +${list.length - 1} wallet${list.length > 2 ? "s" : ""}` : "");
+};
 
 const fmtTime = (ms) =>
   new Date(ms).toLocaleString(undefined,
@@ -797,6 +941,11 @@ function tile(label, valueNode, sub) {
   ]);
 }
 
+/** Meaningful open positions: perps plus non-cash, non-dust token holdings. */
+const openPositionsOf = (t) =>
+  t.positions.length +
+  (t.rh?.tokens.filter((k) => !k.isCash && (k.value == null || k.value >= RH.dustUsd)).length ?? 0);
+
 /* ============================== RENDER ==================================== */
 function render() {
   $("#th-period").textContent = PERIOD_LABEL[state.period];
@@ -834,15 +983,14 @@ function periodCutoff() {
 function rhPnl(t) {
   if (!t.rhOk || !t.rh) return { realised: 0, unrealised: 0, total: 0, gas: 0, volume: 0 };
   const cut = periodCutoff();
-  const sum = (evts) => evts.reduce((s, e) => s + (e.ts >= cut ? e.eth : 0), 0);
-  const rate = t.rh.ethUsd;
-  const gasEth = sum(t.rh.gasEvents);
-  const realised = (sum(t.rh.realisedEvents) - gasEth) * rate;
-  const unrealised = t.rh.unrealisedEth * rate;
+  const sum = (evts) => evts.reduce((s, e) => s + (e.ts >= cut ? e.usd : 0), 0);
+  const gas = sum(t.rh.gasEvents);
+  const realised = sum(t.rh.realisedEvents) - gas;
+  const unrealised = t.rh.unrealisedUsd;
   return {
     realised, unrealised, total: realised + unrealised,
-    gas: gasEth * rate,
-    volume: sum(t.rh.volumeEvents) * rate,
+    gas,
+    volume: sum(t.rh.volumeEvents),
   };
 }
 
@@ -867,7 +1015,7 @@ function roiOf(t) {
   let base = 0;
   if (p.startEquity > 0) base += p.startEquity;
   else if (!t.rh) base += Math.max(0, t.equity - pnl);
-  if (t.rhOk && t.rh) base += t.rh.deployedEth * t.rh.ethUsd;
+  if (t.rhOk && t.rh) base += t.rh.deployedUsd;
   // No capital ever deployed -> there is no return to quote, which is not 0%.
   return base > 0 ? (pnl / base) * 100 : null;
 }
@@ -884,14 +1032,13 @@ function trendSeries(t) {
 
   if (t.rhOk && t.rh?.realisedEvents.length) {
     const cut = periodCutoff();
-    const rate = t.rh.ethUsd;
     const evts = t.rh.realisedEvents
       .filter((e) => e.ts >= cut)
       .sort((a, b) => a.ts - b.ts);
     if (evts.length < 2) return [];
     let run = 0;
     const out = [[evts[0].ts - 1, 0]];
-    for (const e of evts) { run += e.eth * rate; out.push([e.ts, run]); }
+    for (const e of evts) { run += e.usd; out.push([e.ts, run]); }
     return out;
   }
   return [];
@@ -899,12 +1046,12 @@ function trendSeries(t) {
 
 /* --------------------------------------------------------- group summary -- */
 function renderGroupTiles() {
-  const rows = TRADERS.map((t) => state.byAddress.get(t.address)).filter(Boolean);
+  const rows = TRADERS.map((t) => state.byName.get(t.name)).filter(Boolean);
   const active = rows.filter((t) => t.ok && !t.isEmpty);
 
   const equity = active.reduce((s, t) => s + t.equity, 0);
   const volume = active.reduce((s, t) => s + volumeOf(t), 0);
-  const openPos = active.reduce((s, t) => s + t.positions.length + (t.rh?.tokens.length ?? 0), 0);
+  const openPos = active.reduce((s, t) => s + openPositionsOf(t), 0);
 
   // Only traders with a trustworthy PnL figure count toward the group total.
   const withPnl = active.filter((t) => t.pnlCoversAll);
@@ -944,7 +1091,7 @@ const SORTERS = {
 
 function renderBoard() {
   const body = $("#board-body");
-  const rows = TRADERS.map((t) => state.byAddress.get(t.address) ?? { ...t, pending: true });
+  const rows = TRADERS.map((t) => state.byName.get(t.name) ?? { ...t, pending: true });
 
   const { key, dir } = state.sort;
   const get = SORTERS[key] ?? SORTERS.pnl;
@@ -996,7 +1143,7 @@ function boardRow(t, index) {
         el("span", { class: "avatar", text: initials(t.name) }),
         el("div", {}, [
           el("div", { class: "trader-name", text: t.name }),
-          el("span", { class: "trader-addr", text: shortAddr(t.address) }),
+          el("span", { class: "trader-addr", text: walletsLabel(t) }),
         ]),
       ])]),
       el("td", { class: "num", attrs: { colspan: 8 }, text: `Failed to load — ${t.error}` }),
@@ -1011,7 +1158,7 @@ function boardRow(t, index) {
   tr.tabIndex = 0;
   tr.setAttribute("role", "link");
   tr.setAttribute("aria-label", `${t.name}, view positions and trades`);
-  const open = () => { location.hash = `#/t/${t.address}`; };
+  const open = () => { location.hash = `#/t/${encodeURIComponent(t.name)}`; };
   tr.addEventListener("click", open);
   tr.addEventListener("keydown", (e) => {
     if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); }
@@ -1021,7 +1168,11 @@ function boardRow(t, index) {
   const hlTags = t.venues.length
     ? dedupe(t.venues.map((v) => dexLabel(v.dex)))
     : t.hlEquity > 0 ? ["Idle"] : [];
-  const venueTags = [...hlTags, ...(t.rh ? [RH.short] : [])];
+  const venueTags = [
+    ...hlTags,
+    ...(t.rh ? [RH.short] : []),
+    ...(t.baseUsd > 0.01 ? [BASE.short] : []),
+  ];
 
   tr.append(
     el("td", { class: "col-rank", text: isEmpty ? "–" : String(index + 1) }),
@@ -1030,7 +1181,7 @@ function boardRow(t, index) {
         el("span", { class: "avatar", text: initials(t.name) }),
         el("div", {}, [
           el("div", { class: "trader-name", text: t.name }),
-          el("span", { class: "trader-addr", text: shortAddr(t.address) }),
+          el("span", { class: "trader-addr", text: walletsLabel(t) }),
         ]),
       ]),
     ]),
@@ -1071,7 +1222,7 @@ function boardRow(t, index) {
 
   tr.append(
     el("td", { class: "num", text: compactUsd(volumeOf(t)) }),
-    el("td", { class: "num", text: String(t.positions.length + (t.rh?.tokens.length ?? 0)) }),
+    el("td", { class: "num", text: String(openPositionsOf(t)) }),
     el("td", { class: "col-spark" }, [(() => {
       const series = trendSeries(t);
       return series.length > 1 ? sparkline(series) : el("span", { class: "hint", text: "—" });
@@ -1142,7 +1293,7 @@ function sparkline(hist, w = 88, h = 26) {
 
 /* ==================== TRADER DETAIL ====================================== */
 function renderTrader() {
-  const t = state.byAddress.get(state.route.address);
+  const t = state.byName.get(state.route.name);
   if (!t) {
     $("#t-name").textContent = "Loading…";
     $("#t-addr").textContent = "";
@@ -1154,11 +1305,12 @@ function renderTrader() {
   }
 
   $("#t-name").textContent = t.name;
-  $("#t-addr").textContent = shortAddr(t.address);
+  $("#t-addr").textContent = t.addresses.map(shortAddr).join("  ·  ");
 
   const detailTags = [
     ...dedupe(t.venues.map((v) => dexLabel(v.dex))),
     ...(t.rh ? [RH.short] : []),
+    ...(t.baseUsd > 0.01 ? [BASE.short] : []),
   ];
   $("#t-venues").replaceChildren(
     ...(detailTags.length
@@ -1181,6 +1333,7 @@ function renderTrader() {
   // clearinghouse reports 0, so "no venue" must not be read as "no money".
   const parts = t.venues.map((v) => `${dexLabel(v.dex)} ${usd(v.equity)}`);
   if (t.rh) parts.push(`${RH.short} ${usd(t.rh.total)}`);
+  if (t.baseUsd > 0.01) parts.push(`${BASE.short} ${usd(t.baseUsd)}`);
   const equitySub = parts.length
     ? parts.join(" · ")
     : t.equity > 0
@@ -1191,7 +1344,7 @@ function renderTrader() {
   const rp = rhPnl(t);
   const pnl = totalPnlOf(t);
   const bothVenues = t.rh && (t.hlEquity > 0 || t.fills.length);
-  const openCount = t.positions.length + (t.rh?.tokens.length ?? 0);
+  const openCount = openPositionsOf(t);
   const feeNote = t.rh
     ? `net of ${usd(t.feesPaid + rp.gas)} fees & gas`
     : `net of ${usd(t.feesPaid)} fees`;
@@ -1236,8 +1389,6 @@ function renderRobinhood(t) {
     ? `${usd(rh.total)} · ${signedUsd(rp.total)} PnL`
     : `${usd(rh.total)} · PnL unverified`;
 
-  const eth = (v, dp = 4) => `${v >= 0 ? "" : "−"}${Math.abs(v).toFixed(dp)} Ξ`;
-
   const tbl = el("table", { class: "grid" });
   const head = ["Asset", "Quantity", "Price", "Value", "Cost", "Unrealised", "Realised", "Source"];
   tbl.append(el("thead", {}, [el("tr", {}, head.map((h, i) =>
@@ -1261,15 +1412,16 @@ function renderRobinhood(t) {
 
   for (const tok of rh.tokens) {
     const priced = tok.value != null;
-    const costUsd = tok.costEth != null ? tok.costEth * rh.ethUsd : null;
-    const unrealUsd = tok.unrealisedEth != null ? tok.unrealisedEth * rh.ethUsd : null;
-    const realUsd = tok.realisedEth != null ? tok.realisedEth * rh.ethUsd : null;
+    const costUsd = tok.costUsd;
+    const unrealUsd = tok.unrealisedUsd;
+    const realUsd = tok.realisedUsd;
 
     body.push(el("tr", { class: priced && tok.value < RH.dustUsd ? "is-dust" : "" }, [
       el("td", {}, [
         el("strong", { text: tok.symbol }),
         tok.name && tok.name !== tok.symbol ? el("span", { class: "sub-name", text: tok.name }) : null,
         tok.uncosted ? el("span", { class: "tag", attrs: { title: "Arrived as a transfer — cost basis unknown" }, text: "airdrop" }) : null,
+        rh.wallets > 1 && tok.wallet ? el("span", { class: "tag", text: tok.wallet }) : null,
       ]),
       el("td", { class: "num", text: tok.qty.toLocaleString(undefined, { maximumFractionDigits: 4 }) }),
       el("td", { class: "num", text: priced ? "$" + tok.priceUsd.toPrecision(4) : "—" }),
@@ -1279,25 +1431,28 @@ function renderRobinhood(t) {
       el("td", { class: "num" }, [realUsd ? delta(realUsd) : el("span", { class: "hint", text: "—" })]),
       el("td", {}, [el("span", {
         class: "hint",
-        text: tok.source === "pool" ? "DEX pool" : tok.source === "blockscout" ? "explorer" : "no price",
+        text: tok.source === "pool" ? "DEX pool"
+            : tok.source === "blockscout" ? "explorer"
+            : tok.source === "cash" ? "cash ($1)" : "no price",
       })]),
     ]));
   }
 
   // fully-exited positions carry realised PnL but hold no balance
   for (const c of rh.closed) {
-    if (Math.abs(c.realisedEth) < 1e-9) continue;
+    if (Math.abs(c.realisedUsd) < 0.005) continue;
     body.push(el("tr", { class: "is-closed" }, [
       el("td", {}, [
         el("strong", { text: c.symbol }),
         el("span", { class: "tag", text: "closed" }),
+        rh.wallets > 1 && c.wallet ? el("span", { class: "tag", text: c.wallet }) : null,
       ]),
       el("td", { class: "num", text: "0" }),
       el("td", { class: "num", text: "—" }),
       el("td", { class: "num", text: "—" }),
       el("td", { class: "num", text: "—" }),
       el("td", { class: "num", text: "—" }),
-      el("td", { class: "num" }, [delta(c.realisedEth * rh.ethUsd)]),
+      el("td", { class: "num" }, [delta(c.realisedUsd)]),
       el("td", {}, [el("span", { class: "hint", text: `${c.buys}B / ${c.sells}S` })]),
     ]));
   }
@@ -1307,16 +1462,16 @@ function renderRobinhood(t) {
 
   const bits = [
     `Swaps are rebuilt from on-chain history (${rh.txCount} transactions) and priced against each token's DEX pool.`,
-    `PnL is accounted in ETH — the quote asset of every pool here — and shown in dollars at the current rate (${usd(rh.ethUsd)}/ETH).`,
-    `Realised ${eth(rp.total > 0 || rp.realised ? rh.realisedEth : 0)} gross, less ${eth(rh.gasEth)} gas.`,
+    `Trades quoted in USDG are booked at their exact dollar value; ETH-quoted legs use the current rate (${usd(rh.ethUsd)}/ETH).`,
+    `Realised ${signedUsd(rh.realisedUsd)} gross, less ${usd(rh.gasUsd)} gas.`,
   ];
   if (rh.verified) {
     bits.push("Every holding reconciles against the reconstructed history, so the cost basis is sound.");
   } else {
     bits.push("The reconstruction does not reproduce every balance, so PnL is withheld rather than shown wrong.");
   }
-  if (rh.uncostedProceedsEth > 0) {
-    bits.push(`${eth(rh.uncostedProceedsEth)} of proceeds came from tokens that arrived as transfers — ` +
+  if (rh.uncostedProceedsUsd > 0.005) {
+    bits.push(`${usd(rh.uncostedProceedsUsd)} of proceeds came from tokens that arrived as transfers — ` +
               `their cost is unknown, not zero, so they are excluded from realised PnL.`);
   }
   if (rh.unpriced) bits.push(`${rh.unpriced} token${rh.unpriced === 1 ? "" : "s"} had no pool and could not be valued.`);
@@ -1626,12 +1781,10 @@ function renderFills(t) {
 function renderSwapTable(t, swaps) {
   const panel = $("#swaps-panel");
   panel.hidden = false;
-  const rate = t.rh.ethUsd;
-
   $("#swaps-count").textContent =
     `${swaps.length} swap${swaps.length === 1 ? "" : "s"} · newest first`;
 
-  const head = ["Time", "Token", "Side", "Quantity", "ETH", "Value", "Realised"];
+  const head = ["Time", "Token", "Side", "Quantity", "Quote", "Value", "Realised"];
   const tbl = el("table", { class: "grid" });
   tbl.append(el("thead", {}, [el("tr", {}, head.map((h, i) =>
     el("th", { class: i >= 3 ? "num" : "", attrs: { scope: "col" }, text: h })))]));
@@ -1643,10 +1796,12 @@ function renderSwapTable(t, swaps) {
       el("td", {}, [el("strong", { text: s.symbol })]),
       el("td", {}, [el("span", { class: isBuy ? "side-long" : "side-short", text: s.side })]),
       el("td", { class: "num", text: s.qty.toLocaleString(undefined, { maximumFractionDigits: 4 }) }),
-      el("td", { class: "num", text: s.eth ? s.eth.toFixed(6) : "—" }),
-      el("td", { class: "num", text: s.eth ? usd(s.eth * rate) : "—" }),
+      el("td", {}, [s.quote ? el("span", { class: "tag", text: s.quote }) : el("span", { class: "hint", text: "—" })]),
+      el("td", { class: "num", text: s.cashUsd ? usd(s.cashUsd) : "—" }),
       el("td", { class: "num" }, [
-        s.pnlEth != null ? delta(s.pnlEth * rate) : el("span", { class: "hint", text: "—" }),
+        s.pnlUsd !== undefined && s.pnlUsd !== null ? delta(s.pnlUsd)
+          : s.side === "Sell" ? el("span", { class: "hint", attrs: { title: "Cost basis unknown (airdropped tokens)" }, text: "—" })
+          : el("span", { class: "hint", text: "—" }),
       ]),
     ]);
   })));
@@ -1657,12 +1812,15 @@ function renderSwapTable(t, swaps) {
 /* =============================== ROUTING ================================= */
 function readRoute() {
   const h = location.hash.replace(/^#\/?/, "");
-  const m = h.match(/^t\/(0x[0-9a-fA-F]{40})$/);
+  const m = h.match(/^t\/(.+)$/);
   if (m) {
-    const addr = TRADERS.find((t) => t.address.toLowerCase() === m[1].toLowerCase())?.address;
-    if (addr) { state.route = { view: "trader", address: addr }; return; }
+    const key = decodeURIComponent(m[1]);
+    const byName = TRADERS.find((t) => t.name.toLowerCase() === key.toLowerCase());
+    const byAddr = TRADERS.find((t) => t.addresses.some((a) => a.toLowerCase() === key.toLowerCase()));
+    const hit = byName ?? byAddr;
+    if (hit) { state.route = { view: "trader", name: hit.name }; return; }
   }
-  state.route = { view: "board", address: null };
+  state.route = { view: "board", name: null };
 }
 
 function onRouteChange() {
