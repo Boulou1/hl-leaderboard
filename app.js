@@ -868,7 +868,33 @@ function roiOf(t) {
   if (p.startEquity > 0) base += p.startEquity;
   else if (!t.rh) base += Math.max(0, t.equity - pnl);
   if (t.rhOk && t.rh) base += t.rh.deployedEth * t.rh.ethUsd;
-  return base > 0 ? (pnl / base) * 100 : 0;
+  // No capital ever deployed -> there is no return to quote, which is not 0%.
+  return base > 0 ? (pnl / base) * 100 : null;
+}
+
+/**
+ * Series for the Trend sparkline. Prefers Hyperliquid's PnL history; for a
+ * Robinhood-Chain trader that history is all zeros, and drawing it as a flat
+ * line would imply "unchanged" for someone up four figures — so their realised
+ * events are accumulated into a curve instead.
+ */
+function trendSeries(t) {
+  const hist = periodOf(t).pnlHist ?? [];
+  if (hist.length > 1 && hist.some(([, v]) => v !== 0)) return hist;
+
+  if (t.rhOk && t.rh?.realisedEvents.length) {
+    const cut = periodCutoff();
+    const rate = t.rh.ethUsd;
+    const evts = t.rh.realisedEvents
+      .filter((e) => e.ts >= cut)
+      .sort((a, b) => a.ts - b.ts);
+    if (evts.length < 2) return [];
+    let run = 0;
+    const out = [[evts[0].ts - 1, 0]];
+    for (const e of evts) { run += e.eth * rate; out.push([e.ts, run]); }
+    return out;
+  }
+  return [];
 }
 
 /* --------------------------------------------------------- group summary -- */
@@ -898,10 +924,10 @@ function renderGroupTiles() {
         : `across ${withPnl.length} trader${withPnl.length === 1 ? "" : "s"}, both venues`),
     tile("Top performer",
       best ? el("span", { text: best.name }) : el("span", { class: "hint", text: "—" }),
-      best ? `${signedUsd(totalPnlOf(best))} · ${pct(roiOf(best))}` : "no activity yet"),
+      best ? `${signedUsd(totalPnlOf(best))}${roiOf(best) == null ? "" : " · " + pct(roiOf(best))}` : "no activity yet"),
     tile("Laggard",
       worst ? el("span", { text: worst.name }) : el("span", { class: "hint", text: "—" }),
-      worst ? `${signedUsd(totalPnlOf(worst))} · ${pct(roiOf(worst))}` : "—"),
+      worst ? `${signedUsd(totalPnlOf(worst))}${roiOf(worst) == null ? "" : " · " + pct(roiOf(worst))}` : "—"),
     tile(`Volume · ${PERIOD_LABEL[state.period]}`, el("span", { text: compactUsd(volume) }), "notional traded"),
   );
 }
@@ -1032,7 +1058,12 @@ function boardRow(t, index) {
   } else {
     tr.append(
       el("td", { class: "num" }, [delta(pnl)]),
-      el("td", { class: "num" }, [el("span", { class: `delta ${dirClass(pnl)}`, text: pct(roiOf(t)) })]),
+      el("td", { class: "num" }, [(() => {
+        const r = roiOf(t);
+        return r == null
+          ? el("span", { class: "hint", attrs: { title: "No capital deployed to measure a return against" }, text: "—" })
+          : el("span", { class: `delta ${dirClass(r)}`, text: pct(r) });
+      })()]),
       el("td", { class: "num" }, [delta(t.unrealised)]),
       el("td", { class: "num" }, [delta(t.realised)]),
     );
@@ -1041,9 +1072,10 @@ function boardRow(t, index) {
   tr.append(
     el("td", { class: "num", text: compactUsd(volumeOf(t)) }),
     el("td", { class: "num", text: String(t.positions.length + (t.rh?.tokens.length ?? 0)) }),
-    el("td", { class: "col-spark" }, [
-      p.pnlHist.length > 1 ? sparkline(p.pnlHist) : el("span", { class: "hint", text: "—" }),
-    ]),
+    el("td", { class: "col-spark" }, [(() => {
+      const series = trendSeries(t);
+      return series.length > 1 ? sparkline(series) : el("span", { class: "hint", text: "—" });
+    })()]),
   );
 
   if (venueTags.length) tr.querySelector(".trader-cell > div").append(
@@ -1168,7 +1200,8 @@ function renderTrader() {
     tile("Equity", el("span", { text: usd(t.equity) }), equitySub),
     t.pnlCoversAll
       ? tile(`PnL · ${PERIOD_LABEL[state.period]}`, delta(pnl),
-          bothVenues ? `${pct(roiOf(t))} · both venues combined` : pct(roiOf(t)) + " on starting equity")
+          roiOf(t) == null ? "no capital deployed to measure against"
+            : bothVenues ? `${pct(roiOf(t))} · both venues combined` : pct(roiOf(t)) + " on starting equity")
       : naTile(`PnL · ${PERIOD_LABEL[state.period]}`, "swap history unverified"),
     t.pnlCoversAll
       ? tile("Unrealised", delta(t.unrealised),
