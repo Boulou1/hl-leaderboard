@@ -87,6 +87,7 @@ const TRADERS = [
                                  "0x61d58fd76df7eb73095de869ef19dc97b2a341af"] },
   { name: "Ronan",   addresses: ["0x6a1fa415f652FFCf75C96800148c9774c8Fd6903"] },
   { name: "Arun",    addresses: ["0x8a963E0670aCe5A2196D10E97849Ab2aaD5cE0D5"] },
+  { name: "Karel",   addresses: ["0x5d60614346aB1a66b1751Dbc3D90F9eABFD3B6D4"] },
 ];
 
 const PERIOD_LABEL = { day: "24H", week: "7D", month: "30D", allTime: "All" };
