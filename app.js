@@ -88,6 +88,10 @@ const TRADERS = [
   { name: "Ronan",   addresses: ["0x6a1fa415f652FFCf75C96800148c9774c8Fd6903"] },
   { name: "Arun",    addresses: ["0x8a963E0670aCe5A2196D10E97849Ab2aaD5cE0D5"] },
   { name: "Karel",   addresses: ["0x5d60614346aB1a66b1751Dbc3D90F9eABFD3B6D4"] },
+  { name: "Baptiste", addresses: ["0x5Ebd26b71BeF9a2150A25aBe9124F1E2A12CB2E6"] },
+  { name: "Maxime",  addresses: ["0x34D03030E37050FAdF2734030A84ef7B185F12C5"] },
+  { name: "Gabriel", addresses: ["0xe05B21175ac9ff5A193ddf8204F73b7339c8F1B3"] },
+  { name: "Roxana",  addresses: ["0x8824dA5642249A87C0501Be762fA0Cf8A7fCbA6b"] },
 ];
 
 const PERIOD_LABEL = { day: "24H", week: "7D", month: "30D", allTime: "All" };
