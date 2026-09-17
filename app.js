@@ -77,7 +77,8 @@ const BASE = {
  * so a trader is a name plus a LIST of addresses, aggregated everywhere.
  */
 const TRADERS = [
-  { name: "Alberic", addresses: ["0x3df4eb23d7d13e9624c68d7b9c0ec6bb718f0ad0"] },
+  // private: keep tracking this person but never render their address in the UI
+  { name: "Alberic", addresses: ["0x3df4eb23d7d13e9624c68d7b9c0ec6bb718f0ad0"], private: true },
   { name: "Axel",    addresses: ["0x96C19c774bD7D35b1D457492002028DCE719946B"] },
   { name: "Nico",    addresses: ["0x5ef3582E18F43eD152522Ca099AC768DeC492733"] },
   { name: "Pierre",  addresses: ["0x9BFc3ebC18C87987D5D3136E27EEB238139920Ef"] },
@@ -154,20 +155,24 @@ async function loadDexes() {
 }
 
 /* ------------------------------------------------- Robinhood Chain source -- */
-const bsGate = makeGate(4);
+const bsGate = makeGate(3);
 
 async function bsGet(path, retries = 4) {
   return bsGate(async () => {
     for (let attempt = 0; ; attempt++) {
+      let status = 0;
       try {
         const res = await fetch(RH.blockscout + path);
         if (res.ok) return await res.json();
-        const retryable = res.status === 429 || res.status >= 500;
-        if (!retryable || attempt >= retries) throw new Error(`blockscout ${res.status}`);
+        status = res.status;
+        const retryable = status === 429 || status >= 500;
+        if (!retryable || attempt >= retries) throw new Error(`blockscout ${status}`);
       } catch (err) {
         if (attempt >= retries) throw err;
       }
-      await sleep(700 * (attempt + 1));
+      // Rate limits are per-IP and shared by every open tab behind the same
+      // NAT, so a 429 needs a real pause, not a token backoff.
+      await sleep(status === 429 ? 2500 * (attempt + 1) : 700 * (attempt + 1));
     }
   });
 }
@@ -483,7 +488,18 @@ async function rhSwaps(address, ethUsd) {
 /**
  * Holdings, value and PnL for one wallet on Robinhood Chain.
  */
-async function loadRobinhood(address, wallet) {
+/**
+ * Swap-reconstruction cache. The reconstruction walks three paginated
+ * Blockscout endpoints per wallet; redoing it every cycle for 13 traders is
+ * what exhausted the per-IP rate limit (429 storms across every open tab on
+ * the same network). A wallet's history only changes when the wallet
+ * transacts, and every transaction moves its native balance (gas at least),
+ * so `block_number_balance_updated_at` plus the token-balance list is a free
+ * change signal — both come from calls made every cycle anyway.
+ */
+const rhSwapsCache = new Map();   // addr -> { balKey, ethUsd, swaps }
+
+async function loadRobinhood(address, wallet, bypassCache = false) {
   // No catch here: a failed lookup must fail the load (the caller keeps the
   // previous good record), not quietly render an active wallet as unfunded.
   const [summary, balances] = await Promise.all([
@@ -500,7 +516,19 @@ async function loadRobinhood(address, wallet) {
   // Nothing here at all — skip the (expensive) swap reconstruction entirely.
   if (nativeQty === 0 && rawList.length === 0) return null;
 
-  const swaps = await rhSwaps(address, ethUsd);   // throws on incomplete history
+  const key = address.toLowerCase();
+  const balKey = `${summary.block_number_balance_updated_at ?? ""}|` + rawList
+    .map((b) => `${(b.token?.address_hash ?? b.token?.address ?? "")}:${b.value}`)
+    .sort().join(",");
+
+  const hit = rhSwapsCache.get(key);
+  // Books store USD with ETH legs at the rate seen at build time, so a cached
+  // book is only reused while the rate is within 2% — beyond that, rebuild.
+  const rateOk = hit && ethUsd > 0 && Math.abs(hit.ethUsd - ethUsd) / ethUsd < 0.02;
+  const swaps = (!bypassCache && hit && hit.balKey === balKey && rateOk)
+    ? hit.swaps
+    : await rhSwaps(address, ethUsd);   // throws on incomplete history
+  rhSwapsCache.set(key, { balKey, ethUsd: swaps === hit?.swaps ? hit.ethUsd : ethUsd, swaps });
 
   // Price every holding concurrently — serially this is a round trip per token
   // per pool candidate, which visibly stalls the whole page.
@@ -699,7 +727,12 @@ async function loadTrader(trader, knownDexes) {
 
   const [hlParts, rhParts, ethUsd] = await Promise.all([
     Promise.all(addrs.map((a) => loadHlAddress(a, dexes))),
-    Promise.all(addrs.map((a) => loadRobinhood(a, shortAddr(a)))),
+    // Per-wallet labels surface in the holdings panel — neutral ones for
+    // private traders so no rendering path ever carries their address.
+    // Full scans bypass the swap-reconstruction cache; light refreshes reuse
+    // it unless the wallet's balances moved.
+    Promise.all(addrs.map((a, i) =>
+      loadRobinhood(a, trader.private ? `wallet ${i + 1}` : shortAddr(a), knownDexes == null))),
     getEthUsd(),
   ]);
   const baseUsd = (await Promise.all(addrs.map((a) => loadBase(a, ethUsd))))
@@ -876,6 +909,7 @@ const shortAddr = (a) => `${a.slice(0, 6)}…${a.slice(-4)}`;
 
 /** "0x1234…abcd" or "0x1234…abcd +1 wallet" for multi-wallet traders. */
 const walletsLabel = (t) => {
+  if (t.private) return "";        // tracked, but the address stays off-screen
   const list = t.addresses ?? [];
   if (!list.length) return "";
   return shortAddr(list[0]) + (list.length > 1 ? `  +${list.length - 1} wallet${list.length > 2 ? "s" : ""}` : "");
@@ -1351,7 +1385,7 @@ function renderTrader() {
   }
 
   $("#t-name").textContent = t.name;
-  $("#t-addr").textContent = t.addresses.map(shortAddr).join("  ·  ");
+  $("#t-addr").textContent = t.private ? "" : t.addresses.map(shortAddr).join("  ·  ");
 
   const detailTags = [
     ...dedupe(t.venues.map((v) => dexLabel(v.dex))),

@@ -30,6 +30,8 @@ several wallets; everything (equity, PnL, holdings, swaps) is aggregated:
 ```js
 const TRADERS = [
   { name: "Sacha", addresses: ["0x4618…", "0x2fa7…"] },
+  // tracked normally, but the address is never rendered anywhere in the UI:
+  { name: "Someone", addresses: ["0x…"], private: true },
 ];
 ```
 
@@ -155,8 +157,10 @@ crosshair (arrow keys) and a table view for every plotted value.
 
 ## Privacy
 
-Names are shown; addresses are truncated to `0x3df4…0ad0` in the UI, and
-`robots.txt` plus a `noindex` meta tag keep the page out of search results.
+Names are shown; addresses are truncated to the `0x96C1…946B` form in the UI, and
+`robots.txt` plus a `noindex` meta tag keep the page out of search results. A
+trader marked `private: true` keeps full tracking but has no address rendered
+anywhere in the UI at all.
 
 Note that truncation is cosmetic: because the browser queries the API directly, the
 full addresses are present in `app.js` and therefore visible in page source. Hiding
