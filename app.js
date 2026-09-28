@@ -77,8 +77,7 @@ const BASE = {
  * so a trader is a name plus a LIST of addresses, aggregated everywhere.
  */
 const TRADERS = [
-  // private: keep tracking this person but never render their address in the UI
-  { name: "Alberic", addresses: ["0x3df4eb23d7d13e9624c68d7b9c0ec6bb718f0ad0"], private: true },
+  // (`private: true` on an entry keeps tracking but never renders its address)
   { name: "Axel",    addresses: ["0x96C19c774bD7D35b1D457492002028DCE719946B"] },
   { name: "Nico",    addresses: ["0x5ef3582E18F43eD152522Ca099AC768DeC492733"] },
   { name: "Pierre",  addresses: ["0x9BFc3ebC18C87987D5D3136E27EEB238139920Ef"] },
